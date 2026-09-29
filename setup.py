@@ -948,6 +948,13 @@ def _is_cuda() -> bool:
     return VLLM_TARGET_DEVICE == "cuda" and has_cuda and not _is_tpu()
 
 
+def _is_sm12_cuda_build() -> bool:
+    arch_list = os.getenv("TORCH_CUDA_ARCH_LIST")
+    if arch_list:
+        return any(arch.startswith("12.") for arch in arch_list.split(";"))
+    return any(arch.startswith("sm_12") for arch in torch.cuda.get_arch_list())
+
+
 def _is_hip() -> bool:
     return (
         VLLM_TARGET_DEVICE == "cuda" or VLLM_TARGET_DEVICE == "rocm"
@@ -1135,8 +1142,9 @@ if _is_hip():
 
 if _is_cuda():
     ext_modules.append(CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa2_C"))
-    if USE_PRECOMPILED_EXTENSIONS or (
-        CUDA_HOME and get_nvcc_cuda_version() >= Version("12.3")
+    fa3_supported = CUDA_HOME and get_nvcc_cuda_version() >= Version("12.3")
+    if not _is_sm12_cuda_build() and (
+        USE_PRECOMPILED_EXTENSIONS or fa3_supported
     ):
         # FA3 requires CUDA 12.3 or later
         ext_modules.append(CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa3_C"))

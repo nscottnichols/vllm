@@ -350,8 +350,8 @@ endmacro()
 #  `<major>.<minor>[letter]` compute the "loose intersection" with the
 #  `TGT_CUDA_ARCHS` list of gencodes. We also support the `+PTX` suffix in
 #  `SRC_CUDA_ARCHS` which indicates that the PTX code should be built when there
-#  is a CUDA_ARCH in `TGT_CUDA_ARCHS` that is equal to or larger than the
-#  architecture in `SRC_CUDA_ARCHS`.
+#  is a CUDA_ARCH in `TGT_CUDA_ARCHS` in the same major architecture family that
+#  is equal to or larger than the architecture in `SRC_CUDA_ARCHS`.
 # The loose intersection is defined as:
 #   { max{ x \in tgt | x <= y } | y \in src, { x \in tgt | x <= y } != {} }
 #  where `<=` is the version comparison operator.
@@ -462,6 +462,13 @@ function(cuda_archs_loose_intersection OUT_CUDA_ARCHS SRC_CUDA_ARCHS TGT_CUDA_AR
     foreach(_SRC_ARCH ${_SRC_CUDA_ARCHS})
       # Extract the major version of the source arch
       string(REGEX REPLACE "^([0-9]+)\\..*$" "\\1" SRC_ARCH_MAJOR "${_SRC_ARCH}")
+      # The SM12 family has native kernel variants. Avoid JIT-only PTX from
+      # older architecture families so every emitted nvcc gencode is SM12.
+      if (_SRC_ARCH IN_LIST _PTX_ARCHS
+          AND TGT_ARCH_MAJOR STREQUAL "12"
+          AND NOT SRC_ARCH_MAJOR STREQUAL "12")
+        continue()
+      endif()
       # Check version-less-or-equal, and allow PTX arches to match across majors
       if (_SRC_ARCH VERSION_LESS_EQUAL _ARCH)
         if (_SRC_ARCH IN_LIST _PTX_ARCHS OR SRC_ARCH_MAJOR STREQUAL TGT_ARCH_MAJOR)

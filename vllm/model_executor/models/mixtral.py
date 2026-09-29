@@ -56,6 +56,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.sequence import IntermediateTensors
 
 from .interfaces import MixtureOfExperts, SupportsLoRA, SupportsPP
+from .transformers.tiered_weights_hook import tiered_routed_experts
 from .utils import (
     AutoWeightsLoader,
     PPMissingLayer,
@@ -99,6 +100,16 @@ class MixtralMoE(nn.Module):
         parallel_config = vllm_config.parallel_config
         self.enable_eplb = enable_eplb
 
+        tiered_experts = tiered_routed_experts(
+            vllm_config.model_config.hf_config,
+            prefix,
+        )
+        if tiered_experts is None:
+            routed_experts_cls = None
+            routed_experts_args = None
+        else:
+            routed_experts_cls, routed_experts_args = tiered_experts
+
         self.n_routed_experts = num_experts
         self.n_logical_experts = num_experts
         self.n_redundant_experts = parallel_config.eplb_config.num_redundant_experts
@@ -129,6 +140,8 @@ class MixtralMoE(nn.Module):
             enable_eplb=self.enable_eplb,
             num_redundant_experts=self.n_redundant_experts,
             ckpt_names=("w1", "w2", "w3"),
+            routed_experts_cls=routed_experts_cls,
+            routed_experts_args=routed_experts_args,
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:

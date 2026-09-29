@@ -41,6 +41,9 @@ else()
           GIT_REPOSITORY https://github.com/vllm-project/flash-attention.git
           GIT_TAG f3e1a4f74c99145c0717709860bf765de1703779
           GIT_PROGRESS TRUE
+          PATCH_COMMAND ${CMAKE_COMMAND}
+              -DSOURCE_DIR=<SOURCE_DIR>
+              -P ${CMAKE_CURRENT_LIST_DIR}/../patches/force_vllm_fa2_sm12.cmake
           # Don't share the vllm-flash-attn build between build types
           BINARY_DIR ${CMAKE_BINARY_DIR}/vllm-flash-attn
   )

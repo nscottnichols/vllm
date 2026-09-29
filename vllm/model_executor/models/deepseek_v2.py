@@ -24,6 +24,7 @@
 # limitations under the License.
 """Inference-only DeepseekV2/DeepseekV3 model."""
 
+import re
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
@@ -85,6 +86,9 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
+)
+from vllm.model_executor.models.transformers.tiered_weights_hook import (
+    tiered_routed_experts,
 )
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
@@ -355,6 +359,9 @@ class DeepseekV2MoE(nn.Module):
                 prefix=f"{prefix}.shared_experts",
             )
 
+        tiered_experts = tiered_routed_experts(config, prefix)
+        self.use_tiered_routed_experts = tiered_experts is not None
+        routed_experts_cls, routed_experts_args = tiered_experts or (None, None)
         self.experts = FusedMoEFactory(
             shared_experts=self.shared_experts,
             gate=self.gate,
@@ -380,6 +387,8 @@ class DeepseekV2MoE(nn.Module):
             if self.is_fusion_moe_shared_experts_enabled
             else None,
             router_logits_dtype=self.gate.out_dtype,
+            routed_experts_cls=routed_experts_cls,
+            routed_experts_args=routed_experts_args,
         )
 
         if (
@@ -1357,6 +1366,26 @@ class DeepseekV2DecoderLayer(nn.Module):
         return hidden_states, residual
 
 
+_TIERED_ROUTED_EXPERT_WEIGHT_PATTERN = re.compile(
+    r"^layers\.(?P<layer_id>\d+)\.mlp\.experts\.(?P<expert_id>\d+)\."
+    r"(?:gate_proj|up_proj|down_proj)\.weight$"
+)
+
+
+def _is_tiered_routed_expert_weight(
+    name: str,
+    layer_ids: set[int],
+    num_routed_experts: int = 64,
+) -> bool:
+    normalized_name = name[len("model.") :] if name.startswith("model.") else name
+    match = _TIERED_ROUTED_EXPERT_WEIGHT_PATTERN.fullmatch(normalized_name)
+    return (
+        match is not None
+        and int(match.group("layer_id")) in layer_ids
+        and 0 <= int(match.group("expert_id")) < num_routed_experts
+    )
+
+
 @support_torch_compile
 class DeepseekV2Model(nn.Module):
     fall_back_to_pt_during_load = False
@@ -1408,6 +1437,15 @@ class DeepseekV2Model(nn.Module):
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], self.hidden_size
         )
+
+        self.tiered_routed_expert_layer_ids = {
+            layer_idx
+            for layer_idx, layer in enumerate(self.layers)
+            if isinstance(layer, DeepseekV2DecoderLayer)
+            and isinstance(layer.mlp, DeepseekV2MoE)
+            and layer.mlp.use_tiered_routed_experts
+        }
+        self.use_tiered_routed_experts = bool(self.tiered_routed_expert_layer_ids)
 
         self.aux_hidden_state_layers = tuple[int, ...]()
 
@@ -1563,6 +1601,7 @@ class DeepseekV2Model(nn.Module):
         pp_missing_layer_names = get_pp_missing_layer_names(self)
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
+        use_tiered_routed_experts = self.use_tiered_routed_experts
         # With index_topk_freq>1 only some layers build an indexer, yet the
         # checkpoint ships indexer weights for all of them; track the built ones.
         indexer_present_prefixes = {
@@ -1570,6 +1609,16 @@ class DeepseekV2Model(nn.Module):
         }
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
+                continue
+            if (
+                use_tiered_routed_experts
+                and ".mlp.experts." in name
+                and _is_tiered_routed_expert_weight(
+                    name,
+                    self.tiered_routed_expert_layer_ids,
+                    self.config.n_routed_experts,
+                )
+            ):
                 continue
 
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
