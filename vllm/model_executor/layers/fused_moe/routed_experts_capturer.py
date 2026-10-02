@@ -17,7 +17,11 @@ from vllm.config import VllmConfig
 from vllm.distributed.parallel_state import get_tp_group
 from vllm.forward_context import get_forward_context
 from vllm.platforms import current_platform
-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheConfig,
+    UniformTypeKVCacheSpecs,
+)
 from vllm.v1.outputs import RoutedExpertsTensors
 
 logger = logging.getLogger(__name__)
@@ -289,7 +293,15 @@ def bind_routed_experts_capturer(
 def get_routed_experts_attn_gid(kv_cache_config: KVCacheConfig) -> int:
     """Return the full-attention KV cache group used for routed experts."""
     for gid, group in enumerate(kv_cache_config.kv_cache_groups):
-        if isinstance(group.kv_cache_spec, FullAttentionSpec):
+        spec = group.kv_cache_spec
+        nested_specs = (
+            list(spec.kv_cache_specs.values())
+            if isinstance(spec, UniformTypeKVCacheSpecs)
+            else [spec]
+        )
+        if nested_specs and all(
+            isinstance(nested_spec, FullAttentionSpec) for nested_spec in nested_specs
+        ):
             return gid
     raise ValueError("Routed-experts capture requires a full-attention KV cache group.")
 

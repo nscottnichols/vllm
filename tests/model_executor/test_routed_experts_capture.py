@@ -23,8 +23,10 @@ from vllm.transformers_utils.model_arch_config_convertor import (
 )
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
+    MLAAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
+    UniformTypeKVCacheSpecs,
 )
 
 pytestmark = pytest.mark.cpu_test
@@ -336,6 +338,42 @@ def test_routed_experts_attention_group_is_shared_and_fail_closed(monkeypatch):
 
     with pytest.raises(ValueError, match="requires a full-attention KV cache group"):
         get_routed_experts_attn_gid(SimpleNamespace(kv_cache_groups=[]))
+
+
+def test_routed_experts_attention_group_accepts_uniform_mla_specs():
+    main_spec = MLAAttentionSpec(
+        block_size=64,
+        num_kv_heads=1,
+        head_size=576,
+        dtype=torch.float32,
+        cache_dtype_str="fp8_ds_mla",
+    )
+    indexer_spec = MLAAttentionSpec(
+        block_size=64,
+        num_kv_heads=1,
+        head_size=132,
+        dtype=torch.float32,
+        cache_dtype_str="fp8_ds_mla",
+    )
+    uniform_spec = UniformTypeKVCacheSpecs.from_specs(
+        {
+            "model.layers.3.self_attn": main_spec,
+            "model.layers.3.indexer": indexer_spec,
+        }
+    )
+    assert uniform_spec is not None
+    config = KVCacheConfig(
+        num_blocks=2,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["model.layers.3.self_attn", "model.layers.3.indexer"],
+                uniform_spec,
+            )
+        ],
+    )
+
+    assert get_routed_experts_attn_gid(config) == 0
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

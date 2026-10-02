@@ -1368,7 +1368,7 @@ class DeepseekV2DecoderLayer(nn.Module):
 
 _TIERED_ROUTED_EXPERT_WEIGHT_PATTERN = re.compile(
     r"^layers\.(?P<layer_id>\d+)\.mlp\.experts\.(?P<expert_id>\d+)\."
-    r"(?:gate_proj|up_proj|down_proj)\.weight$"
+    r"(?:gate_proj|up_proj|down_proj)\.(?:weight|weight_scale_inv)$"
 )
 
 
