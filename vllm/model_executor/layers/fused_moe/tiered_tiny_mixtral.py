@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import threading
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import AbstractContextManager
@@ -66,41 +67,21 @@ class TinyMixtralTensorProvider(Protocol):
         self, demands: Sequence[Any]
     ) -> AbstractContextManager[TinyMixtralResidentExperts]:
         """Make only the requested tiny-Mixtral expert units resident."""
-        ...
+
+    ...
 
 
-class _TinyMixtralDemandAdapter:
-    _MODEL_NAME = "tiny-mixtral"
-    _EXPERT_COUNT = 8
+@dataclass(frozen=True, slots=True)
+class _TieredTinyMixtralConfig:
+    provider: TinyMixtralTensorProvider
+    adapter: Any | None
 
-    def get_model_name(self) -> str:
-        return self._MODEL_NAME
 
-    def build_demands_for_top_k_routing(
-        self,
-        selected_expert_ids: list[int] | None = None,
-        *,
-        layer_id: int | None = None,
-    ) -> list[WeightDemand]:
-        resolved_layer_id = 0 if layer_id is None else layer_id
-        expert_ids = (
-            range(self._EXPERT_COUNT)
-            if selected_expert_ids is None
-            else selected_expert_ids
-        )
-        demands: list[WeightDemand] = []
-        for expert_id in expert_ids:
-            if not 0 <= expert_id < self._EXPERT_COUNT:
-                raise ValueError(f"tiny-Mixtral expert id {expert_id} is out of range")
-            demands.append(
-                WeightDemand(
-                    unit_id=f"tiny-mixtral-layer-{resolved_layer_id}-expert-{expert_id}",
-                    target_view_id="gpu-vram",
-                    earliest_use_step=0,
-                    deadline_step=1,
-                )
-            )
-        return demands
+_PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
+_UNIT_ID_PATTERN = re.compile(
+    r"^tiny-mixtral-layer-(?P<layer_id>\d+)-expert-(?P<expert_id>\d+)-"
+    r"(?P<projection>gate_proj|up_proj|down_proj)$"
+)
 
 
 class TieredTinyMixtralMoEMethod(FusedMoEMethodBase):
@@ -111,12 +92,17 @@ class TieredTinyMixtralMoEMethod(FusedMoEMethodBase):
         moe: FusedMoEConfig,
         *,
         provider: TinyMixtralTensorProvider,
+        adapter: Any | None = None,
+        prefetch_depth: int | None = None,
     ) -> None:
         super().__init__(moe)
         self._provider = provider
-        self._residency_hook = TieredWeightsResidencyHook(
-            adapter=_TinyMixtralDemandAdapter()
-        )
+        if prefetch_depth is None:
+            prefetch_depth = getattr(provider, "prefetch_depth", 0)
+        if type(prefetch_depth) is not int or not 0 <= prefetch_depth <= 4:
+            raise ValueError("prefetch_depth must be an integer from 0 to 4")
+        self._prefetch_depth = prefetch_depth
+        self._residency_hook = TieredWeightsResidencyHook(adapter=adapter)
         if not self._residency_hook.enable_for_model("tiny-mixtral"):
             raise RuntimeError("the tiny-Mixtral Tiered Weights adapter is unavailable")
 
@@ -151,14 +137,19 @@ class TieredTinyMixtralMoEMethod(FusedMoEMethodBase):
             )
         if topk_weights.shape[0] != x.shape[0] or topk_ids.numel() == 0:
             raise ValueError("tiny-Mixtral routing does not match the token count")
+        if topk_ids.shape[1] != 2:
+            raise ValueError("tiny-Mixtral requires exact top-2 routing")
 
-        selected_expert_ids = {
-            int(expert_id)
-            for routing_row in topk_ids.tolist()
-            for expert_id in routing_row
-        }
-        if any(expert_id < 0 for expert_id in selected_expert_ids):
-            raise ValueError("tiny-Mixtral routing produced an invalid expert id")
+        selected_expert_ids: set[int] = set()
+        for routing_row in topk_ids.tolist():
+            routing_expert_ids = {int(expert_id) for expert_id in routing_row}
+            if len(routing_expert_ids) != 2 or any(
+                expert_id < 0 for expert_id in routing_expert_ids
+            ):
+                raise ValueError(
+                    "tiny-Mixtral routing produced an invalid expert selection"
+                )
+            selected_expert_ids.update(routing_expert_ids)
 
         demands = self._residency_hook.build_demands_from_router(
             router_topk_ids=topk_ids,
@@ -167,14 +158,13 @@ class TieredTinyMixtralMoEMethod(FusedMoEMethodBase):
         )
         if not demands:
             raise RuntimeError("router produced no tiny-Mixtral Tiered Weights demands")
-        demand_expert_ids = {
-            int(demand.unit_id.rsplit("-", 1)[1]) for demand in demands
-        }
-        if demand_expert_ids != selected_expert_ids:
+        demand_expert_groups = _complete_expert_groups(demands)
+        if set(demand_expert_groups) != selected_expert_ids:
             raise RuntimeError(
                 "tiny-Mixtral demand set is not an exact router selection"
             )
 
+        self._prefetch_experts(demands)
         with self._provider.request_experts(demands) as resident_experts:
             return self._execution_callback(
                 x,
@@ -187,6 +177,17 @@ class TieredTinyMixtralMoEMethod(FusedMoEMethodBase):
     def _execution_callback(self) -> TinyMixtralExecutionCallback:
         callback = getattr(self._provider, "execution_callback", None)
         return tiny_mixtral_tiered_execution_callback if callback is None else callback
+
+    def _prefetch_experts(self, demands: list[WeightDemand]) -> None:
+        if self._prefetch_depth == 0:
+            return
+        prefetch = getattr(self._provider, "prefetch_experts", None)
+        if not callable(prefetch):
+            return
+        try:
+            prefetch(demands, depth=self._prefetch_depth)
+        except Exception:
+            return
 
     def apply_monolithic(
         self,
@@ -205,9 +206,11 @@ class TieredTinyMixtralRoutedExperts(RoutedExperts):
         self,
         *args: Any,
         provider: TinyMixtralTensorProvider,
+        adapter: Any | None = None,
         **kwargs: Any,
     ) -> None:
         self._tiered_provider = provider
+        self._tiered_adapter = adapter
         super().__init__(*args, **kwargs)
 
     def _get_quant_method(
@@ -219,6 +222,7 @@ class TieredTinyMixtralRoutedExperts(RoutedExperts):
         return TieredTinyMixtralMoEMethod(
             moe_config,
             provider=self._tiered_provider,
+            adapter=self._tiered_adapter,
         )
 
     def load_weights(
@@ -230,15 +234,20 @@ class TieredTinyMixtralRoutedExperts(RoutedExperts):
 
 
 _TIERED_TINY_MIXTRAL_CONFIG_LOCK = threading.RLock()
-_TIERED_TINY_MIXTRAL_CONFIG: TinyMixtralTensorProvider | None = None
+_TIERED_TINY_MIXTRAL_CONFIG: _TieredTinyMixtralConfig | None = None
 
 
 def configure_tiny_mixtral_tiered_experts(
     provider: TinyMixtralTensorProvider,
+    *,
+    adapter: Any | None = None,
 ) -> None:
     global _TIERED_TINY_MIXTRAL_CONFIG
     with _TIERED_TINY_MIXTRAL_CONFIG_LOCK:
-        _TIERED_TINY_MIXTRAL_CONFIG = provider
+        _TIERED_TINY_MIXTRAL_CONFIG = _TieredTinyMixtralConfig(
+            provider=provider,
+            adapter=adapter,
+        )
     configure_tiered_routed_experts(
         lambda config, prefix: tiny_mixtral_tiered_experts(config, prefix)
     )
@@ -259,7 +268,10 @@ def tiny_mixtral_tiered_experts(
         tiered_config = _TIERED_TINY_MIXTRAL_CONFIG
     if tiered_config is None or not _is_tiny_mixtral(config, prefix):
         return None
-    return TieredTinyMixtralRoutedExperts, {"provider": tiered_config}
+    factory_kwargs: dict[str, Any] = {"provider": tiered_config.provider}
+    if tiered_config.adapter is not None:
+        factory_kwargs["adapter"] = tiered_config.adapter
+    return TieredTinyMixtralRoutedExperts, factory_kwargs
 
 
 def tiny_mixtral_tiered_execution_callback(
@@ -325,3 +337,30 @@ def _is_tiny_mixtral(config: Any, prefix: str) -> bool:
         and getattr(config, "num_experts_per_tok", None) == 2
         and layer_index.isdigit()
     )
+
+
+def _complete_expert_groups(demands: Sequence[WeightDemand]) -> dict[int, set[str]]:
+    groups: dict[int, set[str]] = {}
+    layer_ids: set[int] = set()
+    seen_unit_ids: set[str] = set()
+    for demand in demands:
+        match = _UNIT_ID_PATTERN.fullmatch(demand.unit_id)
+        if match is None:
+            raise ValueError(f"invalid tiny-Mixtral unit ID {demand.unit_id!r}")
+        if demand.unit_id in seen_unit_ids:
+            raise ValueError(f"duplicate tiny-Mixtral demand {demand.unit_id!r}")
+        seen_unit_ids.add(demand.unit_id)
+        layer_ids.add(int(match.group("layer_id")))
+        expert_id = int(match.group("expert_id"))
+        groups.setdefault(expert_id, set()).add(match.group("projection"))
+    if not groups:
+        raise ValueError("tiny-Mixtral demand set is empty")
+    if len(layer_ids) != 1:
+        raise ValueError("tiny-Mixtral demand set spans multiple layers")
+    for expert_id, projections in groups.items():
+        if projections != set(_PROJECTIONS):
+            raise ValueError(
+                "tiny-Mixtral expert group is incomplete for expert "
+                f"{expert_id}: {sorted(projections)!r}"
+            )
+    return groups
