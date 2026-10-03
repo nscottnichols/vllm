@@ -31,6 +31,9 @@ from tiered_weights.runtime import (  # noqa: E402
 )
 from tiered_weights.storage.memory import MemoryWeightStore  # noqa: E402
 
+from vllm.model_executor.layers.fused_moe import (  # noqa: E402
+    tiered_glm as tiered_glm_module,
+)
 from vllm.model_executor.layers.fused_moe.tiered_glm import (  # noqa: E402
     DeviceWeightRuntimeGlmTensorProvider,
     EagerSelectedExpertsGlmTensorProvider,
@@ -318,7 +321,7 @@ def device_runtime_for_tiny_glm(
     expert_count: int = 10,
     max_resident_experts: int = 3,
     slot_count: int = 18,
-    device_budget_bytes: int = 426,
+    device_budget_bytes: int = 600,
     expert_cache_budget_bytes: int | None = None,
     prefetch_depth: int = 1,
 ):
@@ -551,7 +554,7 @@ class RecordingDeviceRuntime:
 def test_vllm_glm_path_routes_and_materializes_layers_3_and_77():
     adapter, runtime, manifest, records, payload, store = device_runtime_for_tiny_glm(
         layer_ids=(3, 77),
-        device_budget_bytes=522,
+        device_budget_bytes=600,
     )
     recording_runtime = RecordingDeviceRuntime(runtime)
     provider = DeviceWeightRuntimeGlmTensorProvider(
@@ -621,7 +624,7 @@ def test_vllm_glm_path_partitions_multi_token_expert_unions():
     adapter, runtime, manifest, records, payload, _ = device_runtime_for_tiny_glm(
         max_resident_experts=8,
         slot_count=1,
-        device_budget_bytes=456,
+        device_budget_bytes=600,
     )
 
     recording_runtime = RecordingDeviceRuntime(runtime)
@@ -703,12 +706,46 @@ def test_glm_execution_scratch_matches_parent_n32_dequant_peak():
     )
 
 
+def test_glm_execution_scratch_accounts_for_fixed_gemm_batches():
+    projection = TieredGlmProjection(
+        expert_id=1,
+        projection="gate_proj",
+        weight=torch.empty((2, 3), dtype=torch.float8_e4m3fn),
+        weight_unit_id="gate_proj.weight",
+        scale=torch.empty((1, 1), dtype=torch.float32),
+        scale_unit_id="gate_proj.weight_scale_inv",
+    )
+    experts = {1: {"gate_proj": projection}}
+
+    for batch_size in (1, 2, 3, 4):
+        hidden_states = torch.empty((batch_size, 3), dtype=torch.bfloat16)
+        padded_activation_bytes = 4 * ((2 * batch_size + 8) * 3 + 12 * 2)
+        callback_activation_bytes = max(
+            4 * batch_size * (5 * 3 + 3 * 2),
+            padded_activation_bytes,
+        )
+        expected_scratch = max(
+            callback_activation_bytes + 16 * 6,
+            20 * batch_size * 3 + 16 * batch_size * 2 + 12 * 6,
+            21 * 6,
+        )
+
+        assert (
+            _glm_53_execution_scratch_bytes(
+                hidden_states,
+                experts,
+                include_output=False,
+            )
+            == expected_scratch
+        )
+
+
 def test_vllm_glm_path_batches_mixed_rows_up_to_provider_max_union():
     adapter, runtime, manifest, records, payload, _ = device_runtime_for_tiny_glm(
         expert_count=18,
         max_resident_experts=12,
         slot_count=1,
-        device_budget_bytes=700,
+        device_budget_bytes=810,
     )
     recording_runtime = RecordingDeviceRuntime(runtime)
     provider = ChunkRecordingProvider(
@@ -761,7 +798,7 @@ def test_vllm_glm_path_consumes_chunk_output_before_release():
         expert_count=18,
         max_resident_experts=12,
         slot_count=1,
-        device_budget_bytes=700,
+        device_budget_bytes=810,
     )
     events = []
 
@@ -906,7 +943,7 @@ def test_vllm_glm_path_reserves_execution_scratch_in_device_budget():
 
 def test_vllm_glm_path_uses_device_runtime_and_selected_experts_only():
     adapter, runtime, manifest, records, payload, store = device_runtime_for_tiny_glm(
-        device_budget_bytes=522,
+        device_budget_bytes=600,
     )
     provider = RecordingGlmProvider(
         DeviceWeightRuntimeGlmTensorProvider(runtime=runtime, adapter=adapter),
@@ -1164,6 +1201,65 @@ def test_glm_execution_callback_timings_preserve_exact_output_and_accumulate():
         assert second_metrics[count_name] >= first_metrics[count_name]
 
 
+def test_glm_execution_callback_uses_fixed_gemm_batch_size(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    adapter, runtime, _, records, payload, _ = device_runtime_for_tiny_glm(
+        max_resident_experts=3,
+        slot_count=18,
+        device_budget_bytes=1000,
+    )
+    provider = DeviceWeightRuntimeGlmTensorProvider(
+        runtime=runtime,
+        adapter=adapter,
+    )
+    demands = [
+        *glm_expert_demands(adapter, expert_id=1),
+        *glm_expert_demands(adapter, expert_id=2),
+    ]
+    generator = torch.Generator().manual_seed(24680)
+    hidden_states = torch.randn((4, 3), generator=generator, dtype=torch.float32)
+    topk_weights = torch.full((4, 2), 0.5, dtype=torch.float32)
+    topk_ids = torch.tile(
+        torch.tensor([[1, 2]], dtype=torch.int32),
+        (4, 1),
+    )
+    original_fixed_batch_input = tiered_glm_module._glm_53_fixed_batch_expert_input
+    fixed_batch_shapes: list[tuple[int, ...]] = []
+    results: dict[int, torch.Tensor] = {}
+
+    def record_fixed_batch_input(expert_input: torch.Tensor) -> torch.Tensor:
+        fixed_batch_input = original_fixed_batch_input(expert_input)
+        fixed_batch_shapes.append(tuple(fixed_batch_input.shape))
+        return fixed_batch_input
+
+    monkeypatch.setattr(
+        tiered_glm_module,
+        "_glm_53_fixed_batch_expert_input",
+        record_fixed_batch_input,
+    )
+
+    with provider.request_experts(demands) as resident_experts:
+        for batch_size in (1, 2, 3, 4):
+            batch_expected = all_resident_reference(
+                hidden_states[:batch_size],
+                topk_weights[:batch_size],
+                topk_ids[:batch_size],
+                all_resident_experts(adapter, records, payload, (1, 2)),
+            )
+            results[batch_size] = glm_53_tiered_execution_callback(
+                hidden_states[:batch_size],
+                topk_weights[:batch_size],
+                topk_ids[:batch_size],
+                resident_experts.experts,
+            )
+            assert torch.equal(results[batch_size], batch_expected)
+
+    assert fixed_batch_shapes == [(4, 3)] * 8
+    for batch_size in (2, 3, 4):
+        assert torch.equal(results[1][0], results[batch_size][0])
+
+
 def test_glm_execution_timing_synchronizes_cuda_stages(monkeypatch: pytest.MonkeyPatch):
     synchronized_devices = []
     monkeypatch.setattr(
@@ -1188,7 +1284,7 @@ def test_glm_execution_timing_synchronizes_cuda_stages(monkeypatch: pytest.Monke
 
 def test_glm_apply_timings_cover_every_diagnostic_bucket():
     adapter, runtime, _, _, _, _ = device_runtime_for_tiny_glm(
-        device_budget_bytes=510,
+        device_budget_bytes=600,
     )
     timings = TieredGlmApplyTimings()
     inner_provider = DeviceWeightRuntimeGlmTensorProvider(
@@ -1259,7 +1355,7 @@ def test_glm_apply_timings_cover_every_diagnostic_bucket():
 
 def test_glm_apply_timings_are_absent_when_diagnostics_are_disabled():
     adapter, runtime, _, records, payload, _ = device_runtime_for_tiny_glm(
-        device_budget_bytes=522,
+        device_budget_bytes=600,
     )
     provider = DeviceWeightRuntimeGlmTensorProvider(runtime=runtime, adapter=adapter)
     method = TieredGlm53MoEMethod(SimpleNamespace(), provider=provider)
@@ -1898,7 +1994,7 @@ def test_vllm_glm_provider_prefetch_is_opt_in_and_counts_success_and_failure(
     monkeypatch: pytest.MonkeyPatch,
 ):
     adapter, runtime, _, records, payload, _ = device_runtime_for_tiny_glm(
-        device_budget_bytes=522,
+        device_budget_bytes=600,
     )
     provider = DeviceWeightRuntimeGlmTensorProvider(runtime=runtime, adapter=adapter)
     method = TieredGlm53MoEMethod(SimpleNamespace(), provider=provider)

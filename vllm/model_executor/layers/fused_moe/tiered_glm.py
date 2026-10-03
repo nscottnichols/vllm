@@ -2176,10 +2176,12 @@ def glm_53_tiered_execution_callback(
             "matmul_activation_accumulation",
             hidden_states.device,
         ):
-            gate_output = expert_input @ gate_weight.T
-            up_output = expert_input @ up_weight.T
+            fixed_batch_input = _glm_53_fixed_batch_expert_input(expert_input)
+            gate_output = fixed_batch_input @ gate_weight.T
+            up_output = fixed_batch_input @ up_weight.T
             intermediate = F.silu(gate_output) * up_output
             expert_output = intermediate @ down_weight.T
+            expert_output = expert_output[: expert_input.shape[0]]
             routing_weights = topk_weights[expert_rows, routing_slots].to(torch.float32)
             output.index_add_(
                 0,
@@ -2188,6 +2190,24 @@ def glm_53_tiered_execution_callback(
             )
 
     return output.to(hidden_states.dtype)
+
+
+_GLM_53_DETERMINISTIC_GEMM_BATCH_SIZE = 4
+
+
+def _glm_53_fixed_batch_expert_input(expert_input: torch.Tensor) -> torch.Tensor:
+    fixed_batch_size = _GLM_53_DETERMINISTIC_GEMM_BATCH_SIZE
+    num_tokens = expert_input.shape[0]
+    if num_tokens >= fixed_batch_size:
+        return expert_input
+
+    padded_input = torch.zeros(
+        (fixed_batch_size, *expert_input.shape[1:]),
+        dtype=expert_input.dtype,
+        device=expert_input.device,
+    )
+    padded_input[:num_tokens].copy_(expert_input)
+    return padded_input
 
 
 def _partition_rows_by_expert_union(
@@ -2239,9 +2259,17 @@ def _glm_53_execution_scratch_bytes(
     gate_weight = next(iter(experts.values()))["gate_proj"].weight
     intermediate_size = gate_weight.shape[0]
     weight_elements = hidden_size * intermediate_size
+    fixed_gemm_rows = max(num_tokens, _GLM_53_DETERMINISTIC_GEMM_BATCH_SIZE)
+    padded_activation_bytes = 4 * (
+        (2 * num_tokens + 2 * fixed_gemm_rows) * hidden_size
+        + 3 * fixed_gemm_rows * intermediate_size
+    )
+    callback_activation_bytes = max(
+        4 * num_tokens * (5 * hidden_size + 3 * intermediate_size),
+        padded_activation_bytes,
+    )
     callback_reservation_bytes = (
-        4 * num_tokens * (5 * hidden_size + 3 * intermediate_size)
-        + 16 * weight_elements
+        callback_activation_bytes + 16 * weight_elements
     )
     matmul_peak_bytes = (
         20 * num_tokens * hidden_size
