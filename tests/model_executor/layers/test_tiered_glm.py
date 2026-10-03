@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import sys
 from concurrent.futures import Future
 from contextlib import contextmanager
@@ -38,14 +39,15 @@ from vllm.model_executor.layers.fused_moe.tiered_glm import (  # noqa: E402
     TieredGlm53RoutedExperts,
     TieredGlmCurrentRouterPredictor,
     TieredGlmExecutionTimings,
-    TieredGlmProjection,
     TieredGlmPreviousTokenLayerPredictor,
     TieredGlmPreviousTokenPredictor,
-    clear_glm_53_tiered_experts,
-    _timed_glm_execution_stage,
-    configure_glm_53_tiered_experts,
+    TieredGlmProjection,
+    TieredGlmRouteController,
     _dequant_glm_53_fp8_block,
     _partition_rows_by_expert_union,
+    _timed_glm_execution_stage,
+    clear_glm_53_tiered_experts,
+    configure_glm_53_tiered_experts,
     glm_53_tiered_execution_callback,
     glm_53_tiered_experts,
 )
@@ -3354,3 +3356,415 @@ def test_clear_glm_53_tiered_experts_closes_prefetch_workers():
     clear_glm_53_tiered_experts()
 
     assert provider.closed
+
+
+def tiered_route_fixture(
+    row_count: int = 4,
+    layer_count: int = 75,
+    top_k: int = 8,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    ids = (
+        torch.arange(top_k, dtype=torch.int32)
+        .repeat(row_count * layer_count, 1)
+        .reshape(row_count, layer_count, top_k)
+    )
+    weight_bits = torch.tensor(
+        [
+            0x00000001,
+            -0x80000000,
+            0x007FFFFF,
+            0x00800000,
+            0x00800001,
+            0x3F7FFFFF,
+            0x3F800001,
+            0x7F7FFFFF,
+        ],
+        dtype=torch.int32,
+    ).repeat(row_count * layer_count, 1)
+    weights = weight_bits.reshape(row_count, layer_count, top_k).view(torch.float32)
+    return ids, weights
+
+
+def test_tiered_glm_route_controller_captures_exact_router_bits():
+    ids, weights = tiered_route_fixture()
+    controller = TieredGlmRouteController.capture()
+    controller.start_capture_sample()
+    for layer_index, layer_id in enumerate(range(3, 78)):
+        layer_ids = ids[:, layer_index]
+        layer_weights = weights[:, layer_index]
+        returned_ids, returned_weights = controller.apply(
+            layer_id,
+            layer_ids,
+            layer_weights,
+        )
+        assert returned_ids is layer_ids
+        assert returned_weights is layer_weights
+
+    captured_ids, captured_weights = controller.finish_capture_sample()
+
+    assert captured_ids.device.type == "cpu"
+    assert captured_weights.device.type == "cpu"
+    assert captured_ids.dtype == torch.int32
+    assert captured_weights.dtype == torch.float32
+    assert captured_ids.shape == ids.shape
+    assert captured_weights.shape == weights.shape
+    assert captured_ids.equal(ids)
+    assert captured_weights.view(torch.int32).equal(weights.view(torch.int32))
+
+
+def test_tiered_glm_route_controller_replays_exact_router_bits():
+    ids, weights = tiered_route_fixture()
+    live_ids = (
+        torch.arange(8, 16, dtype=torch.int32)
+        .repeat(4, 1)
+        .reshape(4, 8)
+    )
+    live_weights = torch.full_like(live_ids, 0.5, dtype=torch.float32)
+    controller = TieredGlmRouteController.replay(ids, weights)
+    for layer_index, layer_id in enumerate(range(3, 78)):
+        returned_ids, returned_weights = controller.apply(
+            layer_id,
+            live_ids,
+            live_weights,
+        )
+        assert returned_ids is live_ids
+        assert returned_weights is live_weights
+        assert live_ids.equal(ids[:, layer_index])
+        assert live_weights.view(torch.int32).equal(
+            weights[:, layer_index].view(torch.int32)
+        )
+
+
+def test_tiered_glm_replay_custom_op_has_a_fake_implementation():
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    with FakeTensorMode():
+        target_ids = torch.ones((1, 2), dtype=torch.int32)
+        target_weights = torch.ones((1, 2), dtype=torch.float32)
+        source_ids = torch.zeros((1, 2), dtype=torch.int32)
+        source_weights = torch.zeros((1, 2), dtype=torch.float32)
+
+        torch.ops.vllm.tiered_glm_replay_router(
+            target_ids,
+            target_weights,
+            source_ids,
+            source_weights,
+        )
+
+        assert target_ids.shape == (1, 2)
+        assert target_weights.shape == (1, 2)
+
+
+def test_tiered_glm_route_controller_stats_are_finite_and_monotonic():
+    capture_controller = TieredGlmRouteController.capture()
+    ids, weights = tiered_route_fixture()
+
+    initial_capture_stats = capture_controller.stats()
+    assert set(initial_capture_stats) == {
+        "capture_count",
+        "capture_sample_count",
+        "capture_layer_count",
+        "replay_count",
+        "replay_layer_count",
+        "apply_count",
+    }
+    assert all(key.endswith("_count") for key in initial_capture_stats)
+    assert all(
+        isinstance(value, int) and math.isfinite(value)
+        for value in initial_capture_stats.values()
+    )
+
+    capture_controller.start_capture_sample()
+    for layer_id in range(3, 78):
+        capture_controller.apply(
+            layer_id,
+            ids[:, layer_id - 3],
+            weights[:, layer_id - 3],
+        )
+    capture_controller.finish_capture_sample()
+    capture_stats = capture_controller.stats()
+
+    replay_controller = TieredGlmRouteController.replay(ids, weights)
+    initial_replay_stats = replay_controller.stats()
+    for layer_id in range(3, 78):
+        replay_controller.apply(
+            layer_id,
+            ids[:, layer_id - 3],
+            weights[:, layer_id - 3],
+        )
+    replay_stats = replay_controller.stats()
+
+    assert capture_stats["capture_count"] == 1
+    assert capture_stats["capture_sample_count"] == 1
+    assert capture_stats["capture_layer_count"] == 75
+    assert capture_stats["replay_count"] == 0
+    assert capture_stats["apply_count"] == 75
+    assert replay_stats["replay_count"] == 1
+    assert replay_stats["replay_layer_count"] == 75
+    assert replay_stats["apply_count"] == 75
+    assert all(
+        capture_stats[key] >= initial_capture_stats[key]
+        for key in initial_capture_stats
+    )
+    assert all(
+        replay_stats[key] >= initial_replay_stats[key]
+        for key in initial_replay_stats
+    )
+
+
+def test_tiered_glm_route_controller_supports_parent_cumulative_replays():
+    ids, weights = tiered_route_fixture()
+    controller = TieredGlmRouteController.replay(
+        ids,
+        weights,
+        row_count=4,
+        layer_count=75,
+        top_k=8,
+        device="cpu",
+    )
+
+    initial_stats = controller.stats()
+    for layer_id in range(3, 78):
+        controller.apply(
+            layer_id,
+            ids[:, layer_id - 3],
+            weights[:, layer_id - 3],
+        )
+    warmup_stats = controller.stats()
+
+    for layer_id in range(3, 78):
+        controller.apply(
+            layer_id,
+            ids[:, layer_id - 3],
+            weights[:, layer_id - 3],
+        )
+
+    final_stats = controller.stats()
+    assert final_stats["replay_count"] == 1
+    assert final_stats["replay_layer_count"] == 150
+    assert final_stats["apply_count"] == 150
+    assert (
+        warmup_stats["replay_layer_count"] - initial_stats["replay_layer_count"]
+        == 75
+    )
+    assert warmup_stats["apply_count"] - initial_stats["apply_count"] == 75
+    assert (
+        final_stats["replay_layer_count"] - warmup_stats["replay_layer_count"]
+        == 75
+    )
+    assert final_stats["apply_count"] - warmup_stats["apply_count"] == 75
+
+
+def test_tiered_glm_route_controller_exposes_missing_replay_layer_count():
+    ids, weights = tiered_route_fixture()
+    controller = TieredGlmRouteController.replay(ids, weights)
+
+    for layer_id in range(3, 77):
+        controller.apply(
+            layer_id,
+            ids[:, layer_id - 3],
+            weights[:, layer_id - 3],
+        )
+
+    stats = controller.stats()
+    assert stats["replay_count"] == 1
+    assert stats["replay_layer_count"] == 74
+    assert stats["apply_count"] == 74
+    assert 75 - stats["replay_layer_count"] == 1
+    with pytest.raises(ValueError, match="replayed more than once"):
+        controller.apply(3, ids[:, 0], weights[:, 0])
+
+
+def test_tiered_glm_route_controller_rejects_invalid_replay_inputs():
+    cases = {
+        "row width": lambda ids, weights: (
+            ids[:3],
+            weights[:3],
+            {},
+        ),
+        "layer width": lambda ids, weights: (
+            ids[:, :74],
+            weights[:, :74],
+            {},
+        ),
+        "top-k": lambda ids, weights: (
+            ids[..., :7],
+            weights[..., :7],
+            {},
+        ),
+        "id dtype": lambda ids, weights: (
+            ids.to(torch.int64),
+            weights,
+            {},
+        ),
+        "weight dtype": lambda ids, weights: (
+            ids,
+            weights.to(torch.float64),
+            {},
+        ),
+        "nonfinite weight": lambda ids, weights: (
+            ids,
+            weights.clone().fill_(float("nan")),
+            {},
+        ),
+        "negative weight": lambda ids, weights: (
+            ids,
+            weights.clone().fill_(-1.0),
+            {},
+        ),
+        "duplicate ids": lambda ids, weights: (
+            ids.clone().fill_(0),
+            weights,
+            {},
+        ),
+    }
+
+    for case_name, prepare_inputs in cases.items():
+        with pytest.raises(ValueError, match="Tiered GLM replay"):
+            ids, weights = tiered_route_fixture()
+            replay_ids, replay_weights, kwargs = prepare_inputs(ids, weights)
+            TieredGlmRouteController.replay(
+                replay_ids,
+                replay_weights,
+                **kwargs,
+            )
+
+
+def test_tiered_glm_route_controller_rejects_invalid_live_inputs():
+    ids, weights = tiered_route_fixture()
+    controller = TieredGlmRouteController.replay(ids, weights)
+    cases = {
+        "row width": lambda ids, weights: (ids[:3], weights[:3]),
+        "top-k": lambda ids, weights: (ids[:, :7], weights[:, :7]),
+        "id dtype": lambda ids, weights: (
+            ids.to(torch.int64),
+            weights,
+        ),
+        "weight dtype": lambda ids, weights: (
+            ids,
+            weights.to(torch.float64),
+        ),
+        "nonfinite weight": lambda ids, weights: (
+            ids,
+            weights.clone().fill_(float("inf")),
+        ),
+        "negative weight": lambda ids, weights: (
+            ids,
+            weights.clone().fill_(-0.25),
+        ),
+        "duplicate ids": lambda ids, weights: (
+            ids.clone().fill_(0),
+            weights,
+        ),
+    }
+
+    for case_name, prepare_inputs in cases.items():
+        with pytest.raises(ValueError, match="Tiered GLM route live"):
+            live_ids, live_weights = prepare_inputs(
+                ids[:, 0].clone(),
+                weights[:, 0].clone(),
+            )
+            controller.apply(3, live_ids, live_weights)
+
+
+def test_tiered_glm_route_controller_fails_closed_on_layer_errors():
+    ids, weights = tiered_route_fixture()
+    controller = TieredGlmRouteController.capture()
+    controller.start_capture_sample()
+
+    for layer_id in (2, 78):
+        with pytest.raises(ValueError, match="outside the configured layer range"):
+            controller.apply(layer_id, ids[:, 0], weights[:, 0])
+
+    controller.apply(3, ids[:, 0], weights[:, 0])
+    with pytest.raises(ValueError, match="captured more than once"):
+        controller.apply(3, ids[:, 0], weights[:, 0])
+    with pytest.raises(RuntimeError, match="missing layers"):
+        controller.finish_capture_sample()
+
+    controller = TieredGlmRouteController.replay(ids, weights)
+    controller.apply(3, ids[:, 0], weights[:, 0])
+    with pytest.raises(ValueError, match="replayed more than once"):
+        controller.apply(3, ids[:, 0], weights[:, 0])
+    with pytest.raises(RuntimeError, match="missing layers"):
+        controller._configure_replay(
+            ids,
+            weights,
+            row_count=4,
+            layer_count=75,
+            top_k=8,
+            device=None,
+        )
+
+
+def test_vllm_glm_method_reads_provider_route_controller_before_demands():
+    manifest = tiny_glm_manifest()
+    payload = manifest_payload(manifest)
+    adapter = Glm53Adapter(manifest)
+    records = {record["unit_id"]: record for record in manifest["records"]}
+    create_tensor, _ = payload_tensor_factory(records, payload)
+    replay_ids = torch.tensor(
+        [[[1, 2]], [[3, 4]]],
+        dtype=torch.int32,
+    )
+    replay_weights = torch.tensor(
+        [[[0.25, 0.75]], [[0.125, 0.875]]],
+        dtype=torch.float32,
+    )
+    controller = TieredGlmRouteController.replay(
+        replay_ids,
+        replay_weights,
+        row_count=2,
+        layer_count=1,
+        top_k=2,
+    )
+
+    class RouteControllerProvider:
+        def __init__(self, provider):
+            self._provider = provider
+            self.route_controller = controller
+            self.request_unit_ids = []
+
+        def request_experts(self, demands):
+            self.request_unit_ids.append([demand.unit_id for demand in demands])
+            return self._provider.request_experts(demands)
+
+    provider = RouteControllerProvider(
+        LazyGlm53TensorProvider(
+            adapter=adapter,
+            tensor_factory=create_tensor,
+            max_resident_units=24,
+        )
+    )
+    method = TieredGlm53MoEMethod(SimpleNamespace(), provider=provider)
+    generator = torch.Generator().manual_seed(2468)
+    hidden_states = torch.randn((2, 3), generator=generator, dtype=torch.float32)
+    expected = all_resident_reference(
+        hidden_states,
+        replay_weights[:, 0],
+        replay_ids[:, 0],
+        all_resident_experts(
+            adapter,
+            records,
+            payload,
+            tuple(range(10)),
+        ),
+    )
+
+    result = method.apply(
+        layer=FakeRoutedExpertsLayer(),
+        x=hidden_states,
+        topk_weights=torch.ones((2, 2), dtype=torch.float32),
+        topk_ids=torch.tensor([[1, 7], [7, 9]], dtype=torch.int32),
+        shared_experts=None,
+        shared_experts_input=None,
+    )
+
+    requested_unit_ids = {
+        unit_id for request in provider.request_unit_ids for unit_id in request
+    }
+    expected_unit_ids = set()
+    for expert_id in (1, 2, 3, 4):
+        expected_unit_ids.update(adapter.expert_unit_ids(expert_id))
+    assert requested_unit_ids == expected_unit_ids
+    assert torch.allclose(result, expected, rtol=0.0, atol=0.0)

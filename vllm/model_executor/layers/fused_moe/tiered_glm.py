@@ -7,17 +7,17 @@ from __future__ import annotations
 import math
 import re
 import threading
+import time
 from collections import Counter, OrderedDict, deque
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass, replace
-import time
 from typing import Any, Protocol, cast
 
 import torch
 import torch.nn.functional as F
-
 from tiered_weights.runtime.derived import DerivedTensorCache
+
 from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
 from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
     FusedMoEMethodBase,
@@ -28,6 +28,7 @@ from vllm.model_executor.models.transformers.tiered_weights_hook import (
     clear_tiered_routed_experts,
     configure_tiered_routed_experts,
 )
+from vllm.utils.torch_utils import direct_register_custom_op
 
 
 @dataclass(frozen=True, slots=True)
@@ -377,6 +378,362 @@ def _validate_exact_expert_demands(
     if requested_units != expected_units:
         raise ValueError("Tiered GLM demand set is not an exact expert union")
     return next(iter(layer_ids))
+
+
+def _tiered_glm_replay_router_impl(
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    replay_ids: torch.Tensor,
+    replay_weights: torch.Tensor,
+) -> None:
+    topk_ids.copy_(replay_ids)
+    topk_weights.copy_(replay_weights)
+
+
+def _tiered_glm_replay_router_fake(
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    replay_ids: torch.Tensor,
+    replay_weights: torch.Tensor,
+) -> None:
+    return None
+
+
+direct_register_custom_op(
+    op_name="tiered_glm_replay_router",
+    op_func=_tiered_glm_replay_router_impl,
+    mutates_args=["topk_ids", "topk_weights"],
+    fake_impl=_tiered_glm_replay_router_fake,
+    dispatch_key="CompositeExplicitAutograd",
+)
+
+
+class TieredGlmRouteController:
+    """Fixture-only controller for exact GLM router capture and replay."""
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._mode: str | None = None
+        self._row_count = 0
+        self._layer_count = 0
+        self._top_k = 0
+        self._capture_sample_active = False
+        self._capture_ids: dict[int, torch.Tensor] = {}
+        self._capture_weights: dict[int, torch.Tensor] = {}
+        self._replay_ids: torch.Tensor | None = None
+        self._replay_weights: torch.Tensor | None = None
+        self._replay_layer_ids: set[int] = set()
+        self._replay_complete = False
+        self._stats = {
+            "capture_count": 0,
+            "capture_sample_count": 0,
+            "capture_layer_count": 0,
+            "replay_count": 0,
+            "replay_layer_count": 0,
+            "apply_count": 0,
+        }
+
+    @classmethod
+    def capture(
+        cls,
+        *,
+        row_count: int = 4,
+        layer_count: int = 75,
+        top_k: int = 8,
+    ) -> TieredGlmRouteController:
+        controller = cls()
+        controller._configure_capture(
+            row_count=row_count,
+            layer_count=layer_count,
+            top_k=top_k,
+        )
+        return controller
+
+    def _configure_capture(
+        self,
+        *,
+        row_count: int,
+        layer_count: int,
+        top_k: int,
+    ) -> None:
+        self._validate_dimensions(row_count, layer_count, top_k)
+        with self._lock:
+            self._fail_if_transition_is_incomplete()
+            if self._capture_sample_active:
+                raise RuntimeError("a Tiered GLM capture sample is already active")
+            self._mode = "capture"
+            self._row_count = row_count
+            self._layer_count = layer_count
+            self._top_k = top_k
+            self._stats["capture_count"] += 1
+
+    @classmethod
+    def replay(
+        cls,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        *,
+        row_count: int = 4,
+        layer_count: int = 75,
+        top_k: int = 8,
+        device: str | torch.device | None = None,
+    ) -> TieredGlmRouteController:
+        controller = cls()
+        controller._configure_replay(
+            topk_ids,
+            topk_weights,
+            row_count=row_count,
+            layer_count=layer_count,
+            top_k=top_k,
+            device=device,
+        )
+        return controller
+
+    def _configure_replay(
+        self,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        row_count: int,
+        layer_count: int,
+        top_k: int,
+        device: str | torch.device | None,
+    ) -> None:
+        self._validate_dimensions(row_count, layer_count, top_k)
+        self._validate_replay_tensors(
+            topk_ids,
+            topk_weights,
+            row_count=row_count,
+            layer_count=layer_count,
+            top_k=top_k,
+        )
+        replay_device = torch.device("cpu") if device is None else torch.device(device)
+        persisted_ids = (
+            topk_ids.detach().to(device=replay_device, copy=True).contiguous()
+        )
+        persisted_weights = (
+            topk_weights.detach().to(device=replay_device, copy=True).contiguous()
+        )
+        with self._lock:
+            self._fail_if_transition_is_incomplete()
+            if self._capture_sample_active:
+                raise RuntimeError("a Tiered GLM capture sample is still active")
+            self._mode = "replay"
+            self._row_count = row_count
+            self._layer_count = layer_count
+            self._top_k = top_k
+            self._replay_ids = persisted_ids
+            self._replay_weights = persisted_weights
+            self._replay_layer_ids = set()
+            self._replay_complete = False
+            self._stats["replay_count"] += 1
+
+    def start_capture_sample(self) -> None:
+        with self._lock:
+            if self._mode != "capture":
+                raise RuntimeError("Tiered GLM route capture mode is not active")
+            if self._capture_sample_active:
+                raise RuntimeError("a Tiered GLM capture sample is already active")
+            self._capture_sample_active = True
+            self._capture_ids = {}
+            self._capture_weights = {}
+
+    def finish_capture_sample(self) -> tuple[torch.Tensor, torch.Tensor]:
+        with self._lock:
+            if self._mode != "capture" or not self._capture_sample_active:
+                raise RuntimeError("no Tiered GLM capture sample is active")
+            expected_layer_ids = self._expected_layer_ids()
+            missing_layer_ids = set(expected_layer_ids).difference(self._capture_ids)
+            if missing_layer_ids:
+                raise RuntimeError(
+                    "Tiered GLM capture sample is missing layers: "
+                    f"{sorted(missing_layer_ids)}"
+                )
+
+            ids = torch.empty(
+                (self._row_count, self._layer_count, self._top_k),
+                dtype=torch.int32,
+                device="cpu",
+            )
+            weights = torch.empty(
+                (self._row_count, self._layer_count, self._top_k),
+                dtype=torch.float32,
+                device="cpu",
+            )
+            for layer_id in expected_layer_ids:
+                layer_index = layer_id - _GLM_53_FIRST_SPARSE_LAYER
+                ids[:, layer_index].copy_(self._capture_ids[layer_id])
+                weights[:, layer_index].copy_(self._capture_weights[layer_id])
+
+            self._capture_sample_active = False
+            self._capture_ids = {}
+            self._capture_weights = {}
+            self._stats["capture_sample_count"] += 1
+            return ids, weights
+
+    def apply(
+        self,
+        layer_id: int,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if type(layer_id) is not int:
+            raise TypeError("Tiered GLM route layer ID must be an integer")
+        with self._lock:
+            if self._mode is None:
+                raise RuntimeError("Tiered GLM route controller has no active mode")
+            if layer_id not in self._expected_layer_ids():
+                raise ValueError(
+                    f"Tiered GLM layer {layer_id} is outside the configured layer range"
+                )
+            self._validate_live_tensors(topk_ids, topk_weights)
+
+            if self._mode == "capture":
+                if not self._capture_sample_active:
+                    raise RuntimeError("no Tiered GLM capture sample is active")
+                if layer_id in self._capture_ids:
+                    raise ValueError(
+                        f"Tiered GLM layer {layer_id} was captured more than once"
+                    )
+                self._capture_ids[layer_id] = (
+                    topk_ids.detach().to(device="cpu", copy=True).contiguous()
+                )
+                self._capture_weights[layer_id] = (
+                    topk_weights.detach().to(device="cpu", copy=True).contiguous()
+                )
+                self._stats["capture_layer_count"] += 1
+                self._stats["apply_count"] += 1
+                return topk_ids, topk_weights
+
+            if layer_id in self._replay_layer_ids:
+                raise ValueError(
+                    f"Tiered GLM layer {layer_id} was replayed more than once"
+                )
+            if not self._replay_layer_ids:
+                self._replay_complete = False
+            replay_ids = self._replay_ids
+            replay_weights = self._replay_weights
+            if replay_ids is None or replay_weights is None:
+                raise RuntimeError("Tiered GLM replay tensors are unavailable")
+
+            layer_index = layer_id - _GLM_53_FIRST_SPARSE_LAYER
+            source_ids = replay_ids[:, layer_index].to(device=topk_ids.device)
+            source_weights = replay_weights[:, layer_index].to(
+                device=topk_weights.device
+            )
+            torch.ops.vllm.tiered_glm_replay_router(
+                topk_ids,
+                topk_weights,
+                source_ids,
+                source_weights,
+            )
+            self._replay_layer_ids.add(layer_id)
+            if self._replay_layer_ids == set(self._expected_layer_ids()):
+                self._replay_layer_ids = set()
+                self._replay_complete = True
+            self._stats["replay_layer_count"] += 1
+            self._stats["apply_count"] += 1
+        return topk_ids, topk_weights
+
+    def stats(self) -> dict[str, int]:
+        with self._lock:
+            return dict(self._stats)
+
+    def _expected_layer_ids(self) -> range:
+        return range(
+            _GLM_53_FIRST_SPARSE_LAYER,
+            _GLM_53_FIRST_SPARSE_LAYER + self._layer_count,
+        )
+
+    def _fail_if_transition_is_incomplete(self) -> None:
+        if self._mode == "replay" and not self._replay_complete:
+            missing_layer_ids = set(self._expected_layer_ids()).difference(
+                self._replay_layer_ids
+            )
+            raise RuntimeError(
+                "Tiered GLM replay is missing layers: "
+                f"{sorted(missing_layer_ids)}"
+            )
+
+    @staticmethod
+    def _validate_dimensions(
+        row_count: int, layer_count: int, top_k: int
+    ) -> None:
+        dimensions = {
+            "row_count": row_count,
+            "layer_count": layer_count,
+            "top_k": top_k,
+        }
+        for name, value in dimensions.items():
+            if type(value) is not int or value <= 0:
+                raise ValueError(f"Tiered GLM route {name} must be a positive integer")
+        if layer_count > _GLM_53_LAST_SPARSE_LAYER - _GLM_53_FIRST_SPARSE_LAYER + 1:
+            raise ValueError("Tiered GLM route layer_count exceeds the sparse layers")
+
+    def _validate_live_tensors(
+        self,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+    ) -> None:
+        if not isinstance(topk_ids, torch.Tensor):
+            raise TypeError("Tiered GLM routing IDs must be a tensor")
+        if not isinstance(topk_weights, torch.Tensor):
+            raise TypeError("Tiered GLM routing weights must be a tensor")
+        if topk_ids.ndim != 2:
+            raise ValueError("Tiered GLM route live IDs must be rank 2")
+        if topk_ids.shape != (self._row_count, self._top_k):
+            raise ValueError(
+                "Tiered GLM route live IDs must have shape "
+                f"{(self._row_count, self._top_k)}"
+            )
+        if topk_ids.dtype != torch.int32:
+            raise ValueError("Tiered GLM route live IDs must be int32")
+        if topk_weights.dtype != torch.float32:
+            raise ValueError("Tiered GLM route live weights must be float32")
+        if topk_weights.shape != topk_ids.shape:
+            raise ValueError("Tiered GLM route live IDs and weights must match shape")
+        if topk_ids.device != topk_weights.device:
+            raise ValueError("Tiered GLM route live tensors must share a device")
+        if not bool(torch.isfinite(topk_weights).all()):
+            raise ValueError("Tiered GLM route live weights must be finite")
+        if not bool((topk_weights >= 0).all()):
+            raise ValueError("Tiered GLM route live weights must be nonnegative")
+        top_k = topk_ids.shape[1]
+        if any(len(set(row.tolist())) != top_k for row in topk_ids):
+            raise ValueError("Tiered GLM route live IDs must be unique per row")
+
+    @staticmethod
+    def _validate_replay_tensors(
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        *,
+        row_count: int,
+        layer_count: int,
+        top_k: int,
+    ) -> None:
+        expected_shape = (row_count, layer_count, top_k)
+        if not isinstance(topk_ids, torch.Tensor):
+            raise TypeError("Tiered GLM replay IDs must be a tensor")
+        if not isinstance(topk_weights, torch.Tensor):
+            raise TypeError("Tiered GLM replay weights must be a tensor")
+        if topk_ids.shape != expected_shape:
+            raise ValueError(
+                f"Tiered GLM replay IDs must have shape {expected_shape}"
+            )
+        if topk_weights.shape != expected_shape:
+            raise ValueError(
+                f"Tiered GLM replay weights must have shape {expected_shape}"
+            )
+        if topk_ids.dtype != torch.int32:
+            raise ValueError("Tiered GLM replay IDs must be int32")
+        if topk_weights.dtype != torch.float32:
+            raise ValueError("Tiered GLM replay weights must be float32")
+        if not bool(torch.isfinite(topk_weights).all()):
+            raise ValueError("Tiered GLM replay weights must be finite")
+        if not bool((topk_weights >= 0).all()):
+            raise ValueError("Tiered GLM replay weights must be nonnegative")
+        for row in topk_ids:
+            if any(len(set(layer.tolist())) != top_k for layer in row):
+                raise ValueError("Tiered GLM replay IDs must be unique per row")
 
 
 class LazyGlm53TensorProvider:
@@ -915,7 +1272,9 @@ class DeviceWeightRuntimeGlmTensorProvider:
                         cache_keys.append(cache_key)
                     else:
                         all_projections_cached = False
-                        cached_projection = leased_projections[expert_id][projection_name]
+                        cached_projection = leased_projections[expert_id][
+                            projection_name
+                        ]
 
                     dequant_cache_key = (
                         cached_projection.weight_unit_id,
@@ -1394,6 +1753,7 @@ class TieredGlm53MoEMethod(FusedMoEMethodBase):
     ) -> None:
         super().__init__(moe)
         self._provider = provider
+        self._route_controller = getattr(provider, "route_controller", None)
         self._residency_hook = TieredWeightsResidencyHook(adapter=adapter)
         if not self._residency_hook.enable_for_model("glm-5.3"):
             raise RuntimeError(
@@ -1425,6 +1785,12 @@ class TieredGlm53MoEMethod(FusedMoEMethodBase):
     ) -> torch.Tensor:
         if topk_ids.ndim != 2:
             raise ValueError("Tiered GLM routing IDs must be rank 2")
+        if self._route_controller is not None:
+            topk_ids, topk_weights = self._route_controller.apply(
+                _parse_glm_layer_id(layer.layer_name),
+                topk_ids,
+                topk_weights,
+            )
         experts_per_token = topk_ids.shape[1]
         if experts_per_token <= 0:
             raise ValueError("Tiered GLM routing selected no experts")
@@ -1656,12 +2022,16 @@ def glm_53_tiered_execution_callback(
         hidden_states.device,
     ):
         selected_experts = {
-            int(expert_id) for routing_row in topk_ids.tolist() for expert_id in routing_row
+            int(expert_id)
+            for routing_row in topk_ids.tolist()
+            for expert_id in routing_row
         }
         if any(expert_id < 0 for expert_id in selected_experts):
             raise ValueError("Tiered GLM routing produced an invalid expert id")
         if selected_experts != set(experts):
-            raise RuntimeError("Tiered GLM resident experts do not match router selection")
+            raise RuntimeError(
+                "Tiered GLM resident experts do not match router selection"
+            )
 
     output = torch.zeros(
         (num_tokens, hidden_size),
@@ -1674,7 +2044,9 @@ def glm_53_tiered_execution_callback(
             "routing_indexing",
             hidden_states.device,
         ):
-            expert_rows, routing_slots = torch.nonzero(topk_ids == expert_id, as_tuple=True)
+            expert_rows, routing_slots = torch.nonzero(
+                topk_ids == expert_id, as_tuple=True
+            )
             projections = experts[expert_id]
             expert_input = hidden_states[expert_rows].to(torch.float32)
 
