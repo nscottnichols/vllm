@@ -7,6 +7,7 @@ from __future__ import annotations
 import hashlib
 import sys
 from concurrent.futures import Future
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -44,6 +45,7 @@ from vllm.model_executor.layers.fused_moe.tiered_glm import (  # noqa: E402
     _timed_glm_execution_stage,
     configure_glm_53_tiered_experts,
     _dequant_glm_53_fp8_block,
+    _partition_rows_by_expert_union,
     glm_53_tiered_execution_callback,
     glm_53_tiered_experts,
 )
@@ -308,13 +310,17 @@ def test_router_demands_group_by_token_and_provider_materializes_only_selection(
 def device_runtime_for_tiny_glm(
     layer_ids: tuple[int, ...] = (3,),
     *,
+    expert_count: int = 10,
     max_resident_experts: int = 3,
     slot_count: int = 18,
     device_budget_bytes: int = 426,
     expert_cache_budget_bytes: int | None = None,
     prefetch_depth: int = 1,
 ):
-    manifest = tiny_glm_manifest(layer_ids=layer_ids)
+    manifest = tiny_glm_manifest(
+        layer_ids=layer_ids,
+        expert_count=expert_count,
+    )
     payload = manifest_payload(manifest)
     for record in manifest["records"]:
         record["checksum_sha256"] = hashlib.sha256(
@@ -397,6 +403,28 @@ class RecordingGlmProvider:
 
     def reserve_execution_scratch(self, scratch_bytes):
         return self._runtime.reserve_scratch(scratch_bytes)
+
+
+class ChunkRecordingProvider:
+    def __init__(self, provider, runtime):
+        self._provider = provider
+        self._runtime = runtime
+        self.acquired_expert_counts = []
+
+    def request_experts(self, demands):
+        acquire_count_before = len(self._runtime.acquire_experts_calls)
+        resident_experts = self._provider.request_experts(demands)
+        acquire_calls = self._runtime.acquire_experts_calls[acquire_count_before:]
+        self.acquired_expert_counts.append(
+            sum(len(selected_expert_ids) for selected_expert_ids, _ in acquire_calls)
+        )
+        return resident_experts
+
+    def reserve_execution_scratch(self, scratch_bytes):
+        return self._provider.reserve_execution_scratch(scratch_bytes)
+
+    def stats(self):
+        return self._provider.stats()
 
 
 class FakeBatchedLeaseSet:
@@ -517,7 +545,8 @@ class RecordingDeviceRuntime:
 
 def test_vllm_glm_path_routes_and_materializes_layers_3_and_77():
     adapter, runtime, manifest, records, payload, store = device_runtime_for_tiny_glm(
-        layer_ids=(3, 77)
+        layer_ids=(3, 77),
+        device_budget_bytes=510,
     )
     recording_runtime = RecordingDeviceRuntime(runtime)
     provider = DeviceWeightRuntimeGlmTensorProvider(
@@ -560,10 +589,7 @@ def test_vllm_glm_path_routes_and_materializes_layers_3_and_77():
         )
 
         assert torch.allclose(result, expected, rtol=0.0, atol=0.0)
-        assert recording_runtime.acquire_experts_calls == [
-            ((1, 7), layer_id),
-            ((7, 9), layer_id),
-        ]
+        assert recording_runtime.acquire_experts_calls == [((1, 7, 9), layer_id)]
 
         expected_unit_ids = set()
         for expert_id in (1, 7, 9):
@@ -592,24 +618,6 @@ def test_vllm_glm_path_partitions_multi_token_expert_unions():
         slot_count=1,
         device_budget_bytes=440,
     )
-
-    class ChunkRecordingProvider:
-        def __init__(self, provider, runtime):
-            self._provider = provider
-            self._runtime = runtime
-            self.acquired_expert_counts = []
-
-        def request_experts(self, demands):
-            acquire_count_before = len(self._runtime.acquire_experts_calls)
-            resident_experts = self._provider.request_experts(demands)
-            acquire_calls = self._runtime.acquire_experts_calls[acquire_count_before:]
-            self.acquired_expert_counts.append(
-                sum(len(selected_expert_ids) for selected_expert_ids, _ in acquire_calls)
-            )
-            return resident_experts
-
-        def reserve_execution_scratch(self, scratch_bytes):
-            return self._provider.reserve_execution_scratch(scratch_bytes)
 
     recording_runtime = RecordingDeviceRuntime(runtime)
     provider = ChunkRecordingProvider(
@@ -653,11 +661,194 @@ def test_vllm_glm_path_partitions_multi_token_expert_unions():
     assert runtime.stats()["active_leases"] == 0
 
 
+def test_partition_rows_by_expert_union_defaults_to_routing_width():
+    topk_ids = torch.tensor([[0, 1], [1, 2], [2, 3]], dtype=torch.int32)
+
+    assert _partition_rows_by_expert_union(topk_ids, 2) == [[0], [1], [2]]
+    assert _partition_rows_by_expert_union(topk_ids, 2, max_expert_union=4) == [
+        [0, 1, 2]
+    ]
+
+
+def test_vllm_glm_path_batches_mixed_rows_up_to_provider_max_union():
+    adapter, runtime, manifest, records, payload, _ = device_runtime_for_tiny_glm(
+        expert_count=18,
+        max_resident_experts=12,
+        slot_count=1,
+        device_budget_bytes=700,
+    )
+    recording_runtime = RecordingDeviceRuntime(runtime)
+    provider = ChunkRecordingProvider(
+        DeviceWeightRuntimeGlmTensorProvider(
+            runtime=recording_runtime,
+            adapter=adapter,
+        ),
+        recording_runtime,
+    )
+    method = TieredGlm53MoEMethod(SimpleNamespace(), provider=provider)
+    generator = torch.Generator().manual_seed(8642)
+    hidden_states = torch.randn((3, 3), generator=generator, dtype=torch.bfloat16)
+    topk_weights = torch.full((3, 8), 0.125, dtype=torch.float32)
+    topk_ids = torch.tensor(
+        [list(range(8)), list(range(4, 12)), list(range(10, 18))],
+        dtype=torch.int32,
+    )
+    expected = all_resident_reference(
+        hidden_states,
+        topk_weights,
+        topk_ids,
+        all_resident_experts(
+            adapter,
+            records,
+            payload,
+            tuple(range(18)),
+        ),
+    )
+
+    result = method.apply(
+        layer=FakeRoutedExpertsLayer(),
+        x=hidden_states,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        shared_experts=None,
+        shared_experts_input=None,
+    )
+
+    assert torch.equal(result, expected)
+    assert provider.acquired_expert_counts == [12, 8]
+    assert all(lease_set.released for lease_set in runtime.lease_sets)
+    runtime_stats = runtime.stats()
+    assert runtime_stats["active_leases"] == 0
+    assert runtime_stats["scratch_bytes"] == 0
+    assert runtime_stats["resident_groups"] <= runtime_stats["max_resident_experts"]
+
+
+def test_vllm_glm_path_consumes_chunk_output_before_release():
+    adapter, runtime, manifest, records, payload, _ = device_runtime_for_tiny_glm(
+        expert_count=18,
+        max_resident_experts=12,
+        slot_count=1,
+        device_budget_bytes=700,
+    )
+    events = []
+
+    class CopyObservingTensor(torch.Tensor):
+        @classmethod
+        def __torch_function__(cls, func, types, args=(), kwargs=None):
+            if func is torch.Tensor.index_copy_:
+                events.append("output-copy")
+            return super().__torch_function__(func, types, args, kwargs)
+
+    class RecordedResidentExperts:
+        def __init__(self, resident_experts):
+            self._resident_experts = resident_experts
+
+        def __enter__(self):
+            return self._resident_experts
+
+        def __exit__(self, exc_type, exc, traceback):
+            events.append("release")
+            return self._resident_experts.__exit__(exc_type, exc, traceback)
+
+    class LifecycleRecordingProvider:
+        def __init__(self, provider):
+            self._provider = provider
+            self._scratch_reservations = 0
+
+        def request_experts(self, demands):
+            events.append("request")
+            return RecordedResidentExperts(self._provider.request_experts(demands))
+
+        def reserve_execution_scratch(self, scratch_bytes):
+            self._scratch_reservations += 1
+            label = (
+                "output-scratch"
+                if self._scratch_reservations == 1
+                else "chunk-scratch"
+            )
+
+            @contextmanager
+            def recorded_reservation():
+                events.append(f"{label}-enter")
+                try:
+                    with self._provider.reserve_execution_scratch(scratch_bytes):
+                        yield
+                finally:
+                    events.append(f"{label}-exit")
+
+            return recorded_reservation()
+
+        def stats(self):
+            return self._provider.stats()
+
+        def execution_callback(self, hidden_states, topk_weights, topk_ids, experts):
+            events.append("callback")
+            result = glm_53_tiered_execution_callback(
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                experts,
+            )
+            return result.as_subclass(CopyObservingTensor)
+
+    provider = LifecycleRecordingProvider(
+        DeviceWeightRuntimeGlmTensorProvider(
+            runtime=RecordingDeviceRuntime(runtime),
+            adapter=adapter,
+        )
+    )
+    method = TieredGlm53MoEMethod(SimpleNamespace(), provider=provider)
+    generator = torch.Generator().manual_seed(1357)
+    hidden_states = torch.randn((2, 3), generator=generator, dtype=torch.bfloat16)
+    topk_weights = torch.full((2, 8), 0.125, dtype=torch.float32)
+    topk_ids = torch.tensor(
+        [list(range(8)), list(range(4, 12))],
+        dtype=torch.int32,
+    )
+    expected = all_resident_reference(
+        hidden_states,
+        topk_weights,
+        topk_ids,
+        all_resident_experts(
+            adapter,
+            records,
+            payload,
+            tuple(range(12)),
+        ),
+    )
+
+    result = method.apply(
+        layer=FakeRoutedExpertsLayer(),
+        x=hidden_states,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        shared_experts=None,
+        shared_experts_input=None,
+    )
+
+    assert torch.equal(result, expected)
+    assert events == [
+        "output-scratch-enter",
+        "request",
+        "chunk-scratch-enter",
+        "callback",
+        "output-copy",
+        "chunk-scratch-exit",
+        "release",
+        "output-scratch-exit",
+    ]
+    runtime_stats = runtime.stats()
+    assert runtime_stats["active_leases"] == 0
+    assert runtime_stats["scratch_bytes"] == 0
+    assert all(lease_set.released for lease_set in runtime.lease_sets)
+
+
 def test_vllm_glm_path_reserves_execution_scratch_in_device_budget():
     adapter, runtime, _, _, _, _ = device_runtime_for_tiny_glm(
-        max_resident_experts=8,
+        expert_count=18,
+        max_resident_experts=12,
         slot_count=1,
-        device_budget_bytes=300,
+        device_budget_bytes=500,
     )
     provider = DeviceWeightRuntimeGlmTensorProvider(runtime=runtime, adapter=adapter)
     method = TieredGlm53MoEMethod(SimpleNamespace(), provider=provider)
@@ -665,9 +856,12 @@ def test_vllm_glm_path_reserves_execution_scratch_in_device_budget():
     with pytest.raises(DeviceRuntimeBackpressureError, match="execution scratch"):
         method.apply(
             layer=FakeRoutedExpertsLayer(),
-            x=torch.zeros((1, 3), dtype=torch.bfloat16),
-            topk_weights=torch.ones((1, 8), dtype=torch.float32),
-            topk_ids=torch.tensor([list(range(8))], dtype=torch.int32),
+            x=torch.zeros((2, 3), dtype=torch.bfloat16),
+            topk_weights=torch.ones((2, 8), dtype=torch.float32),
+            topk_ids=torch.tensor(
+                [list(range(8)), list(range(4, 12))],
+                dtype=torch.int32,
+            ),
             shared_experts=None,
             shared_experts_input=None,
         )
@@ -1511,7 +1705,9 @@ def test_vllm_glm_prefetch_failure_is_output_and_flow_neutral():
 def test_vllm_glm_provider_prefetch_is_opt_in_and_counts_success_and_failure(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    adapter, runtime, _, records, payload, _ = device_runtime_for_tiny_glm()
+    adapter, runtime, _, records, payload, _ = device_runtime_for_tiny_glm(
+        device_budget_bytes=510,
+    )
     provider = DeviceWeightRuntimeGlmTensorProvider(runtime=runtime, adapter=adapter)
     method = TieredGlm53MoEMethod(SimpleNamespace(), provider=provider)
     hidden_states = torch.randn((2, 3), dtype=torch.bfloat16)

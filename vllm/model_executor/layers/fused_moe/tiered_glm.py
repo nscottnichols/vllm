@@ -8,7 +8,7 @@ import math
 import re
 import threading
 from collections import Counter, OrderedDict, deque
-from collections.abc import Callable, Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass, replace
 import time
@@ -1428,6 +1428,7 @@ class TieredGlm53MoEMethod(FusedMoEMethodBase):
         experts_per_token = topk_ids.shape[1]
         if experts_per_token <= 0:
             raise ValueError("Tiered GLM routing selected no experts")
+        max_expert_union = self._provider_max_expert_union(experts_per_token)
 
         next_layer_prefetch_fired = False
         prefetch_experts = getattr(self._provider, "prefetch_experts", None)
@@ -1460,6 +1461,7 @@ class TieredGlm53MoEMethod(FusedMoEMethodBase):
             for row_indices in _partition_rows_by_expert_union(
                 topk_ids,
                 experts_per_token,
+                max_expert_union,
             ):
                 demands = self._residency_hook.build_demands_from_router(
                     router_topk_ids=topk_ids[row_indices],
@@ -1489,11 +1491,13 @@ class TieredGlm53MoEMethod(FusedMoEMethodBase):
                             topk_ids[row_indices],
                             resident_experts.experts,
                         )
-                output.index_copy_(
-                    0,
-                    torch.as_tensor(row_indices, device=x.device, dtype=torch.long),
-                    chunk_output,
-                )
+                        output.index_copy_(
+                            0,
+                            torch.as_tensor(
+                                row_indices, device=x.device, dtype=torch.long
+                            ),
+                            chunk_output,
+                        )
         return output
 
     @property
@@ -1521,6 +1525,23 @@ class TieredGlm53MoEMethod(FusedMoEMethodBase):
             prefetch_next_layer(layer_id, topk_ids)
         except Exception:
             return
+
+    def _provider_max_expert_union(self, experts_per_token: int) -> int:
+        stats_method = getattr(self._provider, "stats", None)
+        if not callable(stats_method):
+            return experts_per_token
+
+        provider_stats = stats_method()
+        if not isinstance(provider_stats, Mapping):
+            raise ValueError("Tiered GLM provider stats must be a mapping")
+        max_expert_union = provider_stats.get("max_resident_experts")
+        if max_expert_union is None:
+            return experts_per_token
+        if type(max_expert_union) is not int or max_expert_union <= 0:
+            raise ValueError(
+                "Tiered GLM provider max_resident_experts must be a positive integer"
+            )
+        return max_expert_union
 
     def apply_monolithic(
         self,
@@ -1688,11 +1709,16 @@ def glm_53_tiered_execution_callback(
 def _partition_rows_by_expert_union(
     topk_ids: torch.Tensor,
     experts_per_token: int,
+    max_expert_union: int | None = None,
 ) -> list[list[int]]:
     if topk_ids.ndim != 2:
         raise ValueError("Tiered GLM routing IDs must be rank 2")
     if topk_ids.shape[1] != experts_per_token:
         raise ValueError("Tiered GLM routing width does not match the expert budget")
+    if max_expert_union is None:
+        max_expert_union = experts_per_token
+    if type(max_expert_union) is not int or max_expert_union <= 0:
+        raise ValueError("Tiered GLM expert union budget must be a positive integer")
 
     row_groups: list[list[int]] = []
     current_rows: list[int] = []
@@ -1701,8 +1727,10 @@ def _partition_rows_by_expert_union(
         row_expert_ids = {int(expert_id) for expert_id in routing_row}
         if len(row_expert_ids) > experts_per_token:
             raise ValueError("Tiered GLM routing row contains duplicate experts")
+        if len(row_expert_ids) > max_expert_union:
+            raise ValueError("Tiered GLM routing row exceeds the expert union budget")
         combined_expert_ids = current_expert_ids | row_expert_ids
-        if current_expert_ids and len(combined_expert_ids) > experts_per_token:
+        if current_expert_ids and len(combined_expert_ids) > max_expert_union:
             row_groups.append(current_rows)
             current_rows = []
             current_expert_ids = set()
