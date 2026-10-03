@@ -1,13 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 
+from vllm.config.compilation import CompilationMode
+from vllm.engine.arg_utils import EngineArgs
 from vllm.utils.mem_constants import GiB_bytes
-from vllm.v1.worker import startup_plan
+from vllm.v1.worker import gpu_worker, startup_plan
+from vllm.v1.worker.gpu_worker import Worker
 from vllm.v1.worker.startup_plan import (
     maybe_apply_startup_plan,
     maybe_save_startup_plan,
@@ -15,6 +19,18 @@ from vllm.v1.worker.startup_plan import (
 
 # Startup-plan persistence (vllm/v1/worker/startup_plan.py), applied and
 # saved by Worker.determine_available_memory / compile_or_warm_up_model.
+
+_MINIMAL_MODEL_CONFIG = {
+    "model_type": "llama",
+    "architectures": ["LlamaForCausalLM"],
+    "hidden_size": 8,
+    "intermediate_size": 16,
+    "num_attention_heads": 2,
+    "num_hidden_layers": 1,
+    "num_key_value_heads": 2,
+    "vocab_size": 32,
+    "torch_dtype": "float16",
+}
 
 
 def _plan_worker(config_hash="abc123", free_memory=78 * GiB_bytes, kv_bytes=None):
@@ -26,6 +42,30 @@ def _plan_worker(config_hash="abc123", free_memory=78 * GiB_bytes, kv_bytes=None
         init_snapshot=SimpleNamespace(free_memory=free_memory),
         cache_config=SimpleNamespace(kv_cache_memory_bytes=kv_bytes),
     )
+
+
+def _warmup_worker(vllm_config):
+    """The minimal Worker surface needed by compile_or_warm_up_model."""
+    worker = Worker.__new__(Worker)
+    worker.vllm_config = vllm_config
+    worker.model_config = vllm_config.model_config
+    worker.cache_config = vllm_config.cache_config
+    worker.compilation_config = vllm_config.compilation_config
+    worker.observability_config = vllm_config.observability_config
+    worker.model_runner = Mock(lora_config=None)
+    worker.use_v2_model_runner = True
+    worker.execute_model = Mock()
+    worker.sample_tokens = Mock()
+    return worker
+
+
+def _engine_config(tmp_path, skip_model_warmup):
+    return EngineArgs(
+        model=str(tmp_path),
+        skip_tokenizer_init=True,
+        enforce_eager=True,
+        skip_model_warmup=skip_model_warmup,
+    ).create_engine_config()
 
 
 def _plan_platform(name="NVIDIA H100 PCIe"):
@@ -77,3 +117,45 @@ def test_startup_plan_apply_gate(plan_env):
     explicit = _plan_worker(kv_bytes=7 * GiB_bytes)
     maybe_apply_startup_plan(explicit)
     assert explicit.cache_config.kv_cache_memory_bytes == 7 * GiB_bytes
+
+
+def test_skip_model_warmup_defaults_false_and_gates_gpu_warmup(tmp_path, monkeypatch):
+    """The opt-in flag skips warmup without changing the default path."""
+    (tmp_path / "config.json").write_text(json.dumps(_MINIMAL_MODEL_CONFIG))
+    default_args = EngineArgs(
+        model=str(tmp_path),
+        skip_tokenizer_init=True,
+        enforce_eager=True,
+    )
+    default_config = default_args.create_engine_config()
+    default_config.compilation_config.mode = CompilationMode.NONE
+    assert default_args.skip_model_warmup is False
+    assert default_config.skip_model_warmup is False
+
+    enabled_config = _engine_config(tmp_path, True)
+    enabled_config.compilation_config.mode = CompilationMode.NONE
+    assert enabled_config.skip_model_warmup is True
+
+    kernel_warmup = Mock()
+    warmup_kernels = Mock()
+    monkeypatch.setattr(gpu_worker, "kernel_warmup", kernel_warmup)
+    monkeypatch.setattr(gpu_worker, "warmup_kernels", warmup_kernels)
+    for name in (
+        "set_random_seed",
+        "freeze_gc_heap",
+        "maybe_attach_gc_debug_callback",
+        "enable_gpu_sync_check",
+        "set_torch_threads_for_runtime",
+    ):
+        monkeypatch.setattr(gpu_worker, name, Mock())
+    monkeypatch.setattr("vllm.utils.jit_monitor.activate", Mock())
+
+    worker = _warmup_worker(default_config)
+    worker.compile_or_warm_up_model()
+    assert kernel_warmup.call_count == 1
+    assert warmup_kernels.call_count == 1
+
+    worker.vllm_config = enabled_config
+    worker.compile_or_warm_up_model()
+    assert kernel_warmup.call_count == 1
+    assert warmup_kernels.call_count == 1

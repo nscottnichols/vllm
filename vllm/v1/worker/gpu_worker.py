@@ -678,6 +678,12 @@ class Worker(WorkerBase):
 
     @instrument(span_name="Warmup (GPU)")
     def compile_or_warm_up_model(self) -> CompilationTimes:
+        if self.vllm_config.skip_model_warmup:
+            return CompilationTimes(
+                language_model=self.compilation_config.compilation_time,
+                encoder=self.compilation_config.encoder_compilation_time,
+            )
+
         warmup_sizes: list[int] = []
 
         if self.vllm_config.compilation_config.mode == CompilationMode.VLLM_COMPILE:
