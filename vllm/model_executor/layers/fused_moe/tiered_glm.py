@@ -91,9 +91,77 @@ class TieredGlmExecutionTimings:
             return {**self._seconds, **self._counts}
 
 
+class TieredGlmApplyTimings:
+    """Thread-safe cumulative timing buckets for the GLM MoE apply path."""
+
+    _STAGE_METRIC_NAMES = {
+        "apply_total": "apply_total",
+        "route_controller": "route_controller",
+        "demand_build": "demand_build",
+        "row_partition": "row_partition",
+        "provider_request": "apply_provider_request",
+        "callback": "callback",
+        "output_copy": "output_copy",
+    }
+    _STAGES = tuple(_STAGE_METRIC_NAMES)
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        metric_names = self._STAGE_METRIC_NAMES.values()
+        self._seconds = {f"{metric_name}_seconds": 0.0 for metric_name in metric_names}
+        self._counts = {f"{metric_name}_count": 0 for metric_name in metric_names}
+
+    def record(self, stage_name: str, elapsed_seconds: float) -> None:
+        if stage_name not in self._STAGES:
+            raise ValueError(f"unknown GLM apply timing stage: {stage_name!r}")
+        if not math.isfinite(elapsed_seconds) or elapsed_seconds < 0:
+            raise RuntimeError(
+                f"non-finite or negative GLM apply timing: {elapsed_seconds}"
+            )
+        metric_name = self._STAGE_METRIC_NAMES[stage_name]
+        with self._lock:
+            updated_seconds = self._seconds[f"{metric_name}_seconds"] + elapsed_seconds
+            if not math.isfinite(updated_seconds):
+                raise RuntimeError(f"GLM apply timing overflow for {stage_name}")
+            self._seconds[f"{metric_name}_seconds"] = updated_seconds
+            self._counts[f"{metric_name}_count"] += 1
+
+    def metrics(self) -> dict[str, float | int]:
+        with self._lock:
+            return {**self._seconds, **self._counts}
+
+
 def _synchronize_glm_timing(device: torch.device) -> None:
     if device.type == "cuda":
         torch.cuda.synchronize(device)
+
+
+_GLM_APPLY_NO_TIMING = nullcontext()
+
+
+@contextmanager
+def _record_glm_apply_timing(
+    timings: TieredGlmApplyTimings,
+    stage_name: str,
+    device: torch.device,
+):
+    _synchronize_glm_timing(device)
+    started = time.perf_counter()
+    try:
+        yield
+    finally:
+        _synchronize_glm_timing(device)
+        timings.record(stage_name, time.perf_counter() - started)
+
+
+def _timed_glm_apply_stage(
+    timings: TieredGlmApplyTimings | None,
+    stage_name: str,
+    device: torch.device,
+):
+    if timings is None:
+        return _GLM_APPLY_NO_TIMING
+    return _record_glm_apply_timing(timings, stage_name, device)
 
 
 @contextmanager
@@ -1123,6 +1191,7 @@ class DeviceWeightRuntimeGlmTensorProvider:
         prefetch_depth: int = 1,
         device_cache_budget_bytes: int | None = None,
         dequant_cache_budget_bytes: int | None = None,
+        apply_timings: TieredGlmApplyTimings | None = None,
     ) -> None:
         if type(prefetch_depth) is not int or not 1 <= prefetch_depth <= 4:
             raise ValueError("prefetch_depth must be an integer from 1 to 4")
@@ -1161,6 +1230,7 @@ class DeviceWeightRuntimeGlmTensorProvider:
         self._active_prefetches: dict[int, Any] = {}
         self._active_prefetch_layer_ids: dict[int, int] = {}
         self._device_cache_budget_bytes = device_cache_budget_bytes
+        self.apply_timings = apply_timings
         self._device_cache: OrderedDict[
             _GlmDeviceCacheKey,
             _GlmDeviceCacheEntry,
@@ -1455,6 +1525,7 @@ class DeviceWeightRuntimeGlmTensorProvider:
 
                 with self._prefetch_queue_lock:
                     self._active_prefetches.pop(placeholder_id, None)
+                    self._active_prefetch_layer_ids.pop(placeholder_id, None)
                     self._active_prefetches[id(future)] = future
                     self._active_prefetch_layer_ids[id(future)] = future_layer_id
                     self._prefetch_queue.popleft()
@@ -1502,6 +1573,13 @@ class DeviceWeightRuntimeGlmTensorProvider:
         self._close_dequant_cache()
 
     def reserve_execution_scratch(self, scratch_bytes: int):
+        reserve_execution_scratch = getattr(
+            self._runtime,
+            "reserve_execution_scratch",
+            None,
+        )
+        if callable(reserve_execution_scratch):
+            return reserve_execution_scratch(scratch_bytes)
         return self._runtime.reserve_scratch(scratch_bytes)
 
     def _reserve_dequant_scratch(self, scratch_bytes: int):
@@ -1509,6 +1587,8 @@ class DeviceWeightRuntimeGlmTensorProvider:
 
     def stats(self) -> dict[str, int | float | str | None]:
         stats = dict(self._runtime.stats())
+        if self.apply_timings is not None:
+            stats.update(self.apply_timings.metrics())
         with self._prefetch_stats_lock:
             stats["prefetch_successes"] = self._prefetch_successes
             stats["prefetch_failures"] = self._prefetch_failures
@@ -1754,6 +1834,7 @@ class TieredGlm53MoEMethod(FusedMoEMethodBase):
         super().__init__(moe)
         self._provider = provider
         self._route_controller = getattr(provider, "route_controller", None)
+        self._apply_timings = getattr(provider, "apply_timings", None)
         self._residency_hook = TieredWeightsResidencyHook(adapter=adapter)
         if not self._residency_hook.enable_for_model("glm-5.3"):
             raise RuntimeError(
@@ -1783,88 +1864,119 @@ class TieredGlm53MoEMethod(FusedMoEMethodBase):
         shared_experts: Any,
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor:
-        if topk_ids.ndim != 2:
-            raise ValueError("Tiered GLM routing IDs must be rank 2")
-        if self._route_controller is not None:
-            topk_ids, topk_weights = self._route_controller.apply(
-                _parse_glm_layer_id(layer.layer_name),
-                topk_ids,
-                topk_weights,
-            )
-        experts_per_token = topk_ids.shape[1]
-        if experts_per_token <= 0:
-            raise ValueError("Tiered GLM routing selected no experts")
-        max_expert_union = self._provider_max_expert_union(experts_per_token)
+        apply_timings = self._apply_timings
+        with _timed_glm_apply_stage(apply_timings, "apply_total", x.device):
+            if topk_ids.ndim != 2:
+                raise ValueError("Tiered GLM routing IDs must be rank 2")
+            if self._route_controller is not None:
+                with _timed_glm_apply_stage(
+                    apply_timings, "route_controller", x.device
+                ):
+                    topk_ids, topk_weights = self._route_controller.apply(
+                        _parse_glm_layer_id(layer.layer_name),
+                        topk_ids,
+                        topk_weights,
+                    )
+            experts_per_token = topk_ids.shape[1]
+            if experts_per_token <= 0:
+                raise ValueError("Tiered GLM routing selected no experts")
+            max_expert_union = self._provider_max_expert_union(experts_per_token)
 
-        next_layer_prefetch_fired = False
-        prefetch_experts = getattr(self._provider, "prefetch_experts", None)
-        if getattr(self._provider, "enable_prefetch", False) and callable(
-            prefetch_experts
-        ):
-            try:
-                prefetch_demands = self._residency_hook.build_demands_from_router(
-                    router_topk_ids=topk_ids,
-                    layer_prefix=layer.layer_name,
-                    target_view_id="gpu-vram",
-                )
-                if prefetch_demands:
-                    prefetch_experts(prefetch_demands)
-            except Exception:
-                pass
-
-        reserve_execution_scratch = getattr(
-            self._provider,
-            "reserve_execution_scratch",
-            None,
-        )
-        output_reservation = (
-            reserve_execution_scratch(x.numel() * x.element_size())
-            if callable(reserve_execution_scratch)
-            else nullcontext()
-        )
-        with output_reservation:
-            output = torch.zeros_like(x)
-            for row_indices in _partition_rows_by_expert_union(
-                topk_ids,
-                experts_per_token,
-                max_expert_union,
+            next_layer_prefetch_fired = False
+            prefetch_experts = getattr(self._provider, "prefetch_experts", None)
+            if getattr(self._provider, "enable_prefetch", False) and callable(
+                prefetch_experts
             ):
-                demands = self._residency_hook.build_demands_from_router(
-                    router_topk_ids=topk_ids[row_indices],
-                    layer_prefix=layer.layer_name,
-                    target_view_id="gpu-vram",
-                )
-                if not demands:
-                    raise RuntimeError(
-                        "router produced no GLM 5.3 Tiered Weights demands"
+                try:
+                    with _timed_glm_apply_stage(
+                        apply_timings, "demand_build", x.device
+                    ):
+                        prefetch_demands = (
+                            self._residency_hook.build_demands_from_router(
+                                router_topk_ids=topk_ids,
+                                layer_prefix=layer.layer_name,
+                                target_view_id="gpu-vram",
+                            )
+                        )
+                    if prefetch_demands:
+                        prefetch_experts(prefetch_demands)
+                except Exception:
+                    pass
+
+            reserve_execution_scratch = getattr(
+                self._provider,
+                "reserve_execution_scratch",
+                None,
+            )
+            output_reservation = (
+                reserve_execution_scratch(x.numel() * x.element_size())
+                if callable(reserve_execution_scratch)
+                else nullcontext()
+            )
+            with output_reservation:
+                output = torch.zeros_like(x)
+                with _timed_glm_apply_stage(apply_timings, "row_partition", x.device):
+                    row_partitions = _partition_rows_by_expert_union(
+                        topk_ids,
+                        experts_per_token,
+                        max_expert_union,
                     )
-                with self._provider.request_experts(demands) as resident_experts:
-                    scratch_bytes = _glm_53_execution_scratch_bytes(
-                        x[row_indices],
-                        resident_experts.experts,
-                    )
-                    if callable(reserve_execution_scratch):
-                        scratch_reservation = reserve_execution_scratch(scratch_bytes)
-                    else:
-                        scratch_reservation = nullcontext()
-                    with scratch_reservation:
-                        if not next_layer_prefetch_fired:
-                            next_layer_prefetch_fired = True
-                            self._prefetch_next_layer_experts(layer, topk_ids)
-                        chunk_output = self._execution_callback(
+                for row_indices in row_partitions:
+                    with _timed_glm_apply_stage(
+                        apply_timings, "demand_build", x.device
+                    ):
+                        demands = self._residency_hook.build_demands_from_router(
+                            router_topk_ids=topk_ids[row_indices],
+                            layer_prefix=layer.layer_name,
+                            target_view_id="gpu-vram",
+                        )
+                    if not demands:
+                        raise RuntimeError(
+                            "router produced no GLM 5.3 Tiered Weights demands"
+                        )
+                    with (
+                        _timed_glm_apply_stage(
+                            apply_timings, "provider_request", x.device
+                        ),
+                        self._provider.request_experts(demands) as resident_experts,
+                    ):
+                        scratch_bytes = _glm_53_execution_scratch_bytes(
                             x[row_indices],
-                            topk_weights[row_indices],
-                            topk_ids[row_indices],
                             resident_experts.experts,
+                            include_output=False,
                         )
-                        output.index_copy_(
-                            0,
-                            torch.as_tensor(
-                                row_indices, device=x.device, dtype=torch.long
-                            ),
-                            chunk_output,
-                        )
-        return output
+                        if callable(reserve_execution_scratch):
+                            scratch_reservation = reserve_execution_scratch(
+                                scratch_bytes
+                            )
+                        else:
+                            scratch_reservation = nullcontext()
+                        with scratch_reservation:
+                            if not next_layer_prefetch_fired:
+                                next_layer_prefetch_fired = True
+                                self._prefetch_next_layer_experts(layer, topk_ids)
+                            with _timed_glm_apply_stage(
+                                apply_timings, "callback", x.device
+                            ):
+                                chunk_output = self._execution_callback(
+                                    x[row_indices],
+                                    topk_weights[row_indices],
+                                    topk_ids[row_indices],
+                                    resident_experts.experts,
+                                )
+                            with _timed_glm_apply_stage(
+                                apply_timings, "output_copy", x.device
+                            ):
+                                output.index_copy_(
+                                    0,
+                                    torch.as_tensor(
+                                        row_indices,
+                                        device=x.device,
+                                        dtype=torch.long,
+                                    ),
+                                    chunk_output,
+                                )
+            return output
 
     @property
     def _execution_callback(self) -> TieredGlmExecutionCallback:
@@ -2116,6 +2228,8 @@ def _partition_rows_by_expert_union(
 def _glm_53_execution_scratch_bytes(
     hidden_states: torch.Tensor,
     experts: dict[int, dict[str, TieredGlmProjection]],
+    *,
+    include_output: bool = True,
 ) -> int:
     if hidden_states.ndim != 2 or not experts:
         raise ValueError(
@@ -2125,10 +2239,24 @@ def _glm_53_execution_scratch_bytes(
     gate_weight = next(iter(experts.values()))["gate_proj"].weight
     intermediate_size = gate_weight.shape[0]
     weight_elements = hidden_size * intermediate_size
-    return (
+    callback_reservation_bytes = (
         4 * num_tokens * (5 * hidden_size + 3 * intermediate_size)
         + 16 * weight_elements
     )
+    matmul_peak_bytes = (
+        20 * num_tokens * hidden_size
+        + 16 * num_tokens * intermediate_size
+        + 12 * weight_elements
+    )
+    dequant_peak_bytes = 21 * weight_elements
+    scratch_bytes = max(
+        callback_reservation_bytes,
+        matmul_peak_bytes,
+        dequant_peak_bytes,
+    )
+    if include_output:
+        scratch_bytes += 2 * num_tokens * hidden_size
+    return scratch_bytes
 
 
 def _dequant_glm_53_fp8_block(projection: TieredGlmProjection) -> torch.Tensor:

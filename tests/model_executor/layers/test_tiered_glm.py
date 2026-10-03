@@ -37,6 +37,7 @@ from vllm.model_executor.layers.fused_moe.tiered_glm import (  # noqa: E402
     LazyGlm53TensorProvider,
     TieredGlm53MoEMethod,
     TieredGlm53RoutedExperts,
+    TieredGlmApplyTimings,
     TieredGlmCurrentRouterPredictor,
     TieredGlmExecutionTimings,
     TieredGlmPreviousTokenLayerPredictor,
@@ -44,7 +45,9 @@ from vllm.model_executor.layers.fused_moe.tiered_glm import (  # noqa: E402
     TieredGlmProjection,
     TieredGlmRouteController,
     _dequant_glm_53_fp8_block,
+    _glm_53_execution_scratch_bytes,
     _partition_rows_by_expert_union,
+    _timed_glm_apply_stage,
     _timed_glm_execution_stage,
     clear_glm_53_tiered_experts,
     configure_glm_53_tiered_experts,
@@ -548,7 +551,7 @@ class RecordingDeviceRuntime:
 def test_vllm_glm_path_routes_and_materializes_layers_3_and_77():
     adapter, runtime, manifest, records, payload, store = device_runtime_for_tiny_glm(
         layer_ids=(3, 77),
-        device_budget_bytes=510,
+        device_budget_bytes=522,
     )
     recording_runtime = RecordingDeviceRuntime(runtime)
     provider = DeviceWeightRuntimeGlmTensorProvider(
@@ -618,7 +621,7 @@ def test_vllm_glm_path_partitions_multi_token_expert_unions():
     adapter, runtime, manifest, records, payload, _ = device_runtime_for_tiny_glm(
         max_resident_experts=8,
         slot_count=1,
-        device_budget_bytes=440,
+        device_budget_bytes=456,
     )
 
     recording_runtime = RecordingDeviceRuntime(runtime)
@@ -670,6 +673,34 @@ def test_partition_rows_by_expert_union_defaults_to_routing_width():
     assert _partition_rows_by_expert_union(topk_ids, 2, max_expert_union=4) == [
         [0, 1, 2]
     ]
+
+
+def test_glm_execution_scratch_matches_parent_n32_dequant_peak():
+    projection = TieredGlmProjection(
+        expert_id=1,
+        projection="gate_proj",
+        weight=torch.empty((2048, 6144), dtype=torch.float8_e4m3fn),
+        weight_unit_id="gate_proj.weight",
+        scale=torch.empty((16, 48), dtype=torch.float32),
+        scale_unit_id="gate_proj.weight_scale_inv",
+    )
+    hidden_states = torch.empty((32, 6144), dtype=torch.bfloat16)
+
+    full_scratch_bytes = _glm_53_execution_scratch_bytes(
+        hidden_states,
+        {1: {"gate_proj": projection}},
+    )
+    nested_scratch_bytes = _glm_53_execution_scratch_bytes(
+        hidden_states,
+        {1: {"gate_proj": projection}},
+        include_output=False,
+    )
+    assert full_scratch_bytes == 264_634_368
+    assert nested_scratch_bytes == 264_241_152
+    assert (
+        full_scratch_bytes - nested_scratch_bytes
+        == hidden_states.numel() * hidden_states.element_size()
+    )
 
 
 def test_vllm_glm_path_batches_mixed_rows_up_to_provider_max_union():
@@ -875,7 +906,7 @@ def test_vllm_glm_path_reserves_execution_scratch_in_device_budget():
 
 def test_vllm_glm_path_uses_device_runtime_and_selected_experts_only():
     adapter, runtime, manifest, records, payload, store = device_runtime_for_tiny_glm(
-        device_budget_bytes=438,
+        device_budget_bytes=522,
     )
     provider = RecordingGlmProvider(
         DeviceWeightRuntimeGlmTensorProvider(runtime=runtime, adapter=adapter),
@@ -1153,6 +1184,165 @@ def test_glm_execution_timing_synchronizes_cuda_stages(monkeypatch: pytest.Monke
     assert synchronized_devices == [cuda_device, cuda_device]
     assert timings.metrics()["routing_indexing_count"] == 1
     assert timings.metrics()["routing_indexing_seconds"] >= 0.0
+
+
+def test_glm_apply_timings_cover_every_diagnostic_bucket():
+    adapter, runtime, _, _, _, _ = device_runtime_for_tiny_glm(
+        device_budget_bytes=510,
+    )
+    timings = TieredGlmApplyTimings()
+    inner_provider = DeviceWeightRuntimeGlmTensorProvider(
+        runtime=runtime,
+        adapter=adapter,
+        apply_timings=timings,
+    )
+
+    class PassthroughRouteController:
+        def __init__(self):
+            self.apply_calls = []
+
+        def apply(self, layer_id, topk_ids, topk_weights):
+            self.apply_calls.append(layer_id)
+            return topk_ids, topk_weights
+
+    class DiagnosticProvider:
+        def __init__(self, provider, route_controller):
+            self._provider = provider
+            self.route_controller = route_controller
+            self.apply_timings = timings
+            self.callback_calls = 0
+
+        def request_experts(self, demands):
+            return self._provider.request_experts(demands)
+
+        def reserve_execution_scratch(self, scratch_bytes):
+            return self._provider.reserve_execution_scratch(scratch_bytes)
+
+        def stats(self):
+            return self._provider.stats()
+
+        def execution_callback(self, hidden_states, topk_weights, topk_ids, experts):
+            self.callback_calls += 1
+            return hidden_states
+
+    route_controller = PassthroughRouteController()
+    provider = DiagnosticProvider(inner_provider, route_controller)
+    method = TieredGlm53MoEMethod(SimpleNamespace(), provider=provider)
+    generator = torch.Generator().manual_seed(97531)
+    hidden_states = torch.randn((2, 3), generator=generator, dtype=torch.float32)
+    topk_weights = torch.tensor(
+        [[0.25, 0.75], [0.75, 0.25]],
+        dtype=torch.float32,
+    )
+    topk_ids = torch.tensor([[1, 2], [2, 1]], dtype=torch.int32)
+
+    result = method.apply(
+        layer=FakeRoutedExpertsLayer(),
+        x=hidden_states,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        shared_experts=None,
+        shared_experts_input=None,
+    )
+
+    assert torch.equal(result, hidden_states)
+    assert route_controller.apply_calls == [3]
+    assert provider.callback_calls == 1
+    metrics = provider.stats()
+    for metric_name in TieredGlmApplyTimings._STAGE_METRIC_NAMES.values():
+        assert metrics[f"{metric_name}_count"] == 1
+        assert metrics[f"{metric_name}_seconds"] >= 0.0
+    assert "provider_request_seconds" not in metrics
+    assert "provider_request_count" not in metrics
+    assert runtime.stats()["active_leases"] == 0
+
+
+def test_glm_apply_timings_are_absent_when_diagnostics_are_disabled():
+    adapter, runtime, _, records, payload, _ = device_runtime_for_tiny_glm(
+        device_budget_bytes=522,
+    )
+    provider = DeviceWeightRuntimeGlmTensorProvider(runtime=runtime, adapter=adapter)
+    method = TieredGlm53MoEMethod(SimpleNamespace(), provider=provider)
+    generator = torch.Generator().manual_seed(13579)
+    hidden_states = torch.randn((2, 3), generator=generator, dtype=torch.float32)
+    topk_weights = torch.tensor(
+        [[0.25, 0.75], [0.75, 0.25]],
+        dtype=torch.float32,
+    )
+    topk_ids = torch.tensor([[1, 2], [2, 1]], dtype=torch.int32)
+    expected = all_resident_reference(
+        hidden_states,
+        topk_weights,
+        topk_ids,
+        all_resident_experts(adapter, records, payload, (1, 2)),
+    )
+
+    result = method.apply(
+        layer=FakeRoutedExpertsLayer(),
+        x=hidden_states,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        shared_experts=None,
+        shared_experts_input=None,
+    )
+
+    assert torch.allclose(result, expected, rtol=0.0, atol=0.0)
+    assert provider.apply_timings is None
+    stats = provider.stats()
+    assert all(
+        f"{metric_name}_seconds" not in stats
+        for metric_name in TieredGlmApplyTimings._STAGE_METRIC_NAMES.values()
+    )
+    assert all(
+        f"{metric_name}_count" not in stats
+        for metric_name in TieredGlmApplyTimings._STAGE_METRIC_NAMES.values()
+    )
+
+
+def test_glm_apply_timing_synchronizes_cuda_boundaries_only_when_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    synchronized_devices = []
+    monkeypatch.setattr(
+        torch.cuda,
+        "synchronize",
+        lambda device: synchronized_devices.append(device),
+    )
+    timings = TieredGlmApplyTimings()
+    cuda_device = SimpleNamespace(type="cuda")
+
+    for stage_name in ("route_controller", "output_copy"):
+        with _timed_glm_apply_stage(timings, stage_name, cuda_device):
+            pass
+
+    assert synchronized_devices == [cuda_device] * 4
+    assert timings.metrics()["route_controller_count"] == 1
+    assert timings.metrics()["output_copy_count"] == 1
+
+    for stage_name in ("route_controller", "output_copy"):
+        with _timed_glm_apply_stage(None, stage_name, cuda_device):
+            pass
+
+    assert synchronized_devices == [cuda_device] * 4
+
+
+def test_provider_reserve_execution_scratch_falls_back_to_legacy_runtime():
+    class LegacyRuntime:
+        def __init__(self):
+            self.reserve_scratch_calls = []
+
+        def reserve_scratch(self, scratch_bytes):
+            self.reserve_scratch_calls.append(scratch_bytes)
+            return "legacy-reservation"
+
+    runtime = LegacyRuntime()
+    provider = DeviceWeightRuntimeGlmTensorProvider(
+        runtime=runtime,
+        adapter=SimpleNamespace(),
+    )
+
+    assert provider.reserve_execution_scratch(123) == "legacy-reservation"
+    assert runtime.reserve_scratch_calls == [123]
 
 
 def test_glm_fp8_block_dequantization_aligned_fast_path_is_exact():
@@ -1708,7 +1898,7 @@ def test_vllm_glm_provider_prefetch_is_opt_in_and_counts_success_and_failure(
     monkeypatch: pytest.MonkeyPatch,
 ):
     adapter, runtime, _, records, payload, _ = device_runtime_for_tiny_glm(
-        device_budget_bytes=510,
+        device_budget_bytes=522,
     )
     provider = DeviceWeightRuntimeGlmTensorProvider(runtime=runtime, adapter=adapter)
     method = TieredGlm53MoEMethod(SimpleNamespace(), provider=provider)
@@ -2825,6 +3015,8 @@ def test_vllm_glm_current_router_predictor_fires_on_every_sparse_layer():
         assert provider.stats()["next_layer_prefetch_successes"] == 4
         assert provider.stats()["next_layer_prefetch_failures"] == 0
         assert runtime.stats()["active_leases"] == 0
+        assert provider._active_prefetches == {}
+        assert provider._active_prefetch_layer_ids == {}
     finally:
         runtime.close_prefetches(wait=True)
 
