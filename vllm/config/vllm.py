@@ -424,6 +424,9 @@ class VllmConfig:
     'throughput' favors aggregate tokens/sec at high concurrency (larger CUDA
     graphs, more aggressive batching, throughput-oriented kernels)."""
 
+    skip_model_warmup: bool = False
+    """Whether to skip model and kernel warmup during engine initialization."""
+
     weight_transfer_config: WeightTransferConfig | None = None
     """The configurations for weight transfer during RL training."""
 

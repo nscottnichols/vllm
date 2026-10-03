@@ -733,6 +733,7 @@ class EngineArgs:
     kv_sharing_fast_prefill: bool = CacheConfig.kv_sharing_fast_prefill
     optimization_level: OptimizationLevel = VllmConfig.optimization_level
     performance_mode: PerformanceMode = VllmConfig.performance_mode
+    skip_model_warmup: bool = VllmConfig.skip_model_warmup
 
     fault_tolerance_config: FaultToleranceConfig = get_field(
         ParallelConfig, "fault_tolerance_config"
@@ -1645,6 +1646,9 @@ class EngineArgs:
         )
         vllm_group.add_argument("--performance-mode", **vllm_kwargs["performance_mode"])
         vllm_group.add_argument(
+            "--skip-model-warmup", **vllm_kwargs["skip_model_warmup"]
+        )
+        vllm_group.add_argument(
             "--weight-transfer-config", **vllm_kwargs["weight_transfer_config"]
         )
 
@@ -2511,6 +2515,7 @@ class EngineArgs:
             additional_config=self.additional_config,
             optimization_level=self.optimization_level,
             performance_mode=self.performance_mode,
+            skip_model_warmup=self.skip_model_warmup,
             weight_transfer_config=self.weight_transfer_config,
             shutdown_timeout=self.shutdown_timeout,
         )

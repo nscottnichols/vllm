@@ -254,6 +254,12 @@ class CPUWorker(Worker):
         return kv_cache_size
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
+        if self.vllm_config.skip_model_warmup:
+            return CompilationTimes(
+                language_model=self.compilation_config.compilation_time,
+                encoder=self.compilation_config.encoder_compilation_time,
+            )
+
         # Note: the model has been compiled in determine_available_memory(),
         # Only compile here for models without kv cache
         if len(self.model_runner.kv_caches) == 0:
