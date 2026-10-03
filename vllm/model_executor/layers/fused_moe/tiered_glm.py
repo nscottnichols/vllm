@@ -154,6 +154,10 @@ class TieredGlmTensorProvider(Protocol):
         """Reserve callback scratch against a coherent device budget."""
         ...
 
+    def drain_prefetches(self) -> None:
+        """Wait for queued prefetch work without closing caches or storage."""
+        ...
+
 
 @dataclass(frozen=True, slots=True)
 class _TieredGlm53Config:
@@ -649,6 +653,9 @@ class EagerSelectedExpertsGlmTensorProvider:
                 "storage_read_bytes": self._read_bytes,
             }
 
+    def drain_prefetches(self) -> None:
+        return None
+
     def _ordered_tensor_specs(
         self,
         selected_experts: set[tuple[int, int]],
@@ -1119,6 +1126,15 @@ class DeviceWeightRuntimeGlmTensorProvider:
             self._active_prefetches.pop(id(future), None)
             self._active_prefetch_layer_ids.pop(id(future), None)
         self._submit_next_prefetch()
+
+    def drain_prefetches(self) -> None:
+        """Wait for active and queued prefetch work without closing runtime."""
+        while True:
+            self._submit_next_prefetch()
+            self._runtime.drain_prefetches()
+            with self._prefetch_queue_lock:
+                if not self._prefetch_queue and not self._active_prefetches:
+                    return
 
     def close_prefetches(self, *, wait: bool = True) -> None:
         close_prefetches = getattr(self._runtime, "close_prefetches", None)

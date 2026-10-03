@@ -2069,6 +2069,138 @@ def test_vllm_glm_prefetch_depth_bounds_submissions_to_four_layers():
     assert provider.stats()["next_layer_prefetch_failures"] == 0
 
 
+def test_vllm_glm_drain_prefetches_drains_active_and_queued_work():
+    class DrainingRuntime:
+        def __init__(self):
+            self.futures = []
+            self.submit_calls = []
+            self.drain_calls = 0
+            self.close_calls = []
+
+        def submit_expert_cache_prefetch(self, selected_expert_ids, *, layer_id=None):
+            selected_expert_ids = tuple(selected_expert_ids)
+            self.submit_calls.append((selected_expert_ids, layer_id))
+            future = Future()
+            self.futures.append(future)
+            return future
+
+        def drain_prefetches(self):
+            self.drain_calls += 1
+            while self.futures:
+                self.futures.pop(0).set_result(None)
+
+        def close_prefetches(self, *, wait=True):
+            self.close_calls.append(wait)
+
+        def stats(self):
+            return {"expert_cache_budget_bytes": 1000}
+
+    runtime = DrainingRuntime()
+    provider = DeviceWeightRuntimeGlmTensorProvider(
+        runtime=runtime,
+        adapter=object(),
+        enable_next_layer_prefetch=True,
+        prefetch_depth=2,
+        next_layer_prediction_provider=lambda layer_id, topk_ids: (1,)
+        if layer_id == 4
+        else (2,),
+    )
+    original_submit_next_prefetch = provider._submit_next_prefetch
+    provider._submit_next_prefetch = lambda: None
+    try:
+        provider.prefetch_next_layer_experts(
+            3,
+            torch.tensor([[1, 2]], dtype=torch.int32),
+        )
+    finally:
+        provider._submit_next_prefetch = original_submit_next_prefetch
+
+    assert provider.stats()["next_layer_prefetch_queued"] == 2
+    provider.drain_prefetches()
+
+    stats = provider.stats()
+    assert runtime.submit_calls == [((1,), 4), ((2,), 5)]
+    assert runtime.drain_calls == 1
+    assert stats["next_layer_prefetch_active"] == 0
+    assert stats["next_layer_prefetch_queued"] == 0
+    assert runtime.close_calls == []
+
+
+def test_vllm_glm_drain_prefetches_samples_zero_staging_and_keeps_provider_usable():
+    adapter, base_runtime, _, _, _, store = device_runtime_for_tiny_glm(
+        layer_ids=(3,),
+        expert_cache_budget_bytes=1000,
+    )
+
+    class DrainingRuntime:
+        def __init__(self):
+            self.futures = []
+            self.staging_bytes = 0
+            self.close_calls = []
+
+        def submit_expert_cache_prefetch(self, selected_expert_ids, *, layer_id=None):
+            future = Future()
+            self.futures.append(future)
+            self.staging_bytes += 12
+            return future
+
+        def drain_prefetches(self):
+            while self.futures:
+                self.futures.pop(0).set_result(None)
+            self.staging_bytes = 0
+
+        def acquire_experts(self, selected_expert_ids, *, layer_id=None):
+            return base_runtime.acquire_experts(
+                selected_expert_ids,
+                layer_id=layer_id,
+            )
+
+        def reserve_scratch(self, scratch_bytes):
+            return base_runtime.reserve_scratch(scratch_bytes)
+
+        def stats(self):
+            stats = dict(base_runtime.stats())
+            stats["expert_cache_staging_bytes"] = self.staging_bytes
+            return stats
+
+        def close_prefetches(self, *, wait=True):
+            self.close_calls.append(wait)
+
+    runtime = DrainingRuntime()
+    provider = DeviceWeightRuntimeGlmTensorProvider(
+        runtime=runtime,
+        adapter=adapter,
+        enable_next_layer_prefetch=True,
+        prefetch_depth=1,
+        dequant_cache_budget_bytes=100,
+        next_layer_prediction_provider=lambda layer_id, topk_ids: (1,),
+    )
+    runtime.submit_expert_cache_prefetch((0,), layer_id=77)
+    assert provider.stats()["expert_cache_staging_bytes"] == 12
+
+    provider.prefetch_next_layer_experts(
+        3,
+        torch.tensor([[1, 2]], dtype=torch.int32),
+    )
+    provider.drain_prefetches()
+
+    stats = provider.stats()
+    assert stats["expert_cache_staging_bytes"] == 0
+    assert stats["next_layer_prefetch_active"] == 0
+    assert stats["next_layer_prefetch_queued"] == 0
+
+    store.reads.clear()
+    with provider.request_experts(glm_expert_demands(adapter, expert_id=1)):
+        pass
+
+    stats = provider.stats()
+    assert store.reads
+    assert stats["active_leases"] == 0
+    assert stats["dequant_cache_bytes"] > 0
+    assert stats["dequant_cache_active_leases"] == 0
+    assert runtime.close_calls == []
+
+
 def test_vllm_glm_multi_layer_prefetch_selects_host_cache_when_configured():
     adapter, runtime, _, _, _, _ = device_runtime_for_tiny_glm(
         layer_ids=(3, 4, 5, 77),
