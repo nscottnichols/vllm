@@ -50,21 +50,24 @@ def _warmup_worker(vllm_config):
     worker.vllm_config = vllm_config
     worker.model_config = vllm_config.model_config
     worker.cache_config = vllm_config.cache_config
+    worker.parallel_config = vllm_config.parallel_config
     worker.compilation_config = vllm_config.compilation_config
     worker.observability_config = vllm_config.observability_config
     worker.model_runner = Mock(lora_config=None)
     worker.use_v2_model_runner = True
     worker.execute_model = Mock()
     worker.sample_tokens = Mock()
+    worker.init_snapshot = SimpleNamespace(free_memory=8 * GiB_bytes)
     return worker
 
 
-def _engine_config(tmp_path, skip_model_warmup):
+def _engine_config(tmp_path, skip_model_warmup, kv_cache_memory_bytes=None):
     return EngineArgs(
         model=str(tmp_path),
         skip_tokenizer_init=True,
         enforce_eager=True,
         skip_model_warmup=skip_model_warmup,
+        kv_cache_memory_bytes=kv_cache_memory_bytes,
     ).create_engine_config()
 
 
@@ -159,3 +162,27 @@ def test_skip_model_warmup_defaults_false_and_gates_gpu_warmup(tmp_path, monkeyp
     worker.compile_or_warm_up_model()
     assert kernel_warmup.call_count == 1
     assert warmup_kernels.call_count == 1
+
+
+def test_skip_model_warmup_skips_profile_with_explicit_kv_cache(tmp_path, monkeypatch):
+    """Explicit KV sizing plus opt-in warmup skip avoids the profile run."""
+    (tmp_path / "config.json").write_text(json.dumps(_MINIMAL_MODEL_CONFIG))
+    default_config = _engine_config(tmp_path, False, kv_cache_memory_bytes=1024)
+    skipped_config = _engine_config(tmp_path, True, kv_cache_memory_bytes=1024)
+    reserve_mm_ipc_gpu_memory = Mock(return_value=1024)
+
+    monkeypatch.setattr(gpu_worker, "maybe_apply_startup_plan", Mock())
+    monkeypatch.setattr(
+        gpu_worker,
+        "reserve_mm_ipc_gpu_memory",
+        reserve_mm_ipc_gpu_memory,
+    )
+
+    default_worker = _warmup_worker(default_config)
+    assert default_worker.determine_available_memory() == 1024
+    assert default_worker.model_runner.profile_run.call_count == 1
+
+    skipped_worker = _warmup_worker(skipped_config)
+    assert skipped_worker.determine_available_memory() == 1024
+    assert skipped_worker.model_runner.profile_run.call_count == 0
+    assert reserve_mm_ipc_gpu_memory.call_count == 2

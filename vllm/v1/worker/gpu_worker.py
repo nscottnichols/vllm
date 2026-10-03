@@ -473,9 +473,9 @@ class Worker(WorkerBase):
         maybe_apply_startup_plan(self)
 
         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
-            # still need a profile run which compiles the model for
-            # max_num_batched_tokens
-            self.model_runner.profile_run()
+            # A profile run still compiles the model for max_num_batched_tokens.
+            if not self.vllm_config.skip_model_warmup:
+                self.model_runner.profile_run()
 
             msg = (
                 f"Initial free memory {format_gib(self.init_snapshot.free_memory)} "
