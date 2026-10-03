@@ -31,9 +31,6 @@ from tiered_weights.runtime import (  # noqa: E402
 )
 from tiered_weights.storage.memory import MemoryWeightStore  # noqa: E402
 
-from vllm.model_executor.layers.fused_moe import (  # noqa: E402
-    tiered_glm as tiered_glm_module,
-)
 from vllm.model_executor.layers.fused_moe.tiered_glm import (  # noqa: E402
     DeviceWeightRuntimeGlmTensorProvider,
     EagerSelectedExpertsGlmTensorProvider,
@@ -199,17 +196,14 @@ def all_resident_reference(
     for expert_id in sorted(selected_experts):
         rows, slots = torch.nonzero(topk_ids == expert_id, as_tuple=True)
         weights = dequant_projection(experts[expert_id])
-        expert_input = hidden_states[rows].to(torch.float32)
-        gate_output = expert_input @ weights["gate_proj"].T
-        up_output = expert_input @ weights["up_proj"].T
-        intermediate = F.silu(gate_output) * up_output
-        expert_output = intermediate @ weights["down_proj"].T
-        routing_weights = topk_weights[rows, slots].to(torch.float32)
-        output.index_add_(
-            0,
-            rows,
-            expert_output * routing_weights.unsqueeze(1),
-        )
+        for row, slot in zip(rows.tolist(), slots.tolist()):
+            expert_input = hidden_states[row].to(torch.float32).unsqueeze(0)
+            gate_output = expert_input @ weights["gate_proj"].T
+            up_output = expert_input @ weights["up_proj"].T
+            intermediate = F.silu(gate_output) * up_output
+            expert_output = intermediate @ weights["down_proj"].T
+            routing_weight = topk_weights[row, slot].to(torch.float32)
+            output[row] += expert_output[0] * routing_weight
     return output.to(hidden_states.dtype)
 
 
@@ -706,7 +700,7 @@ def test_glm_execution_scratch_matches_parent_n32_dequant_peak():
     )
 
 
-def test_glm_execution_scratch_accounts_for_fixed_gemm_batches():
+def test_glm_execution_scratch_accounts_for_row_independent_gemm():
     projection = TieredGlmProjection(
         expert_id=1,
         projection="gate_proj",
@@ -719,7 +713,7 @@ def test_glm_execution_scratch_accounts_for_fixed_gemm_batches():
 
     for batch_size in (1, 2, 3, 4):
         hidden_states = torch.empty((batch_size, 3), dtype=torch.bfloat16)
-        padded_activation_bytes = 4 * ((2 * batch_size + 8) * 3 + 12 * 2)
+        padded_activation_bytes = 4 * ((2 * batch_size + 2) * 3 + 3 * 2)
         callback_activation_bytes = max(
             4 * batch_size * (5 * 3 + 3 * 2),
             padded_activation_bytes,
@@ -1201,8 +1195,7 @@ def test_glm_execution_callback_timings_preserve_exact_output_and_accumulate():
         assert second_metrics[count_name] >= first_metrics[count_name]
 
 
-def test_glm_execution_callback_uses_fixed_gemm_batch_size(
-    monkeypatch: pytest.MonkeyPatch,
+def test_glm_execution_callback_is_row_independent(
 ):
     adapter, runtime, _, records, payload, _ = device_runtime_for_tiny_glm(
         max_resident_experts=3,
@@ -1224,20 +1217,7 @@ def test_glm_execution_callback_uses_fixed_gemm_batch_size(
         torch.tensor([[1, 2]], dtype=torch.int32),
         (4, 1),
     )
-    original_fixed_batch_input = tiered_glm_module._glm_53_fixed_batch_expert_input
-    fixed_batch_shapes: list[tuple[int, ...]] = []
     results: dict[int, torch.Tensor] = {}
-
-    def record_fixed_batch_input(expert_input: torch.Tensor) -> torch.Tensor:
-        fixed_batch_input = original_fixed_batch_input(expert_input)
-        fixed_batch_shapes.append(tuple(fixed_batch_input.shape))
-        return fixed_batch_input
-
-    monkeypatch.setattr(
-        tiered_glm_module,
-        "_glm_53_fixed_batch_expert_input",
-        record_fixed_batch_input,
-    )
 
     with provider.request_experts(demands) as resident_experts:
         for batch_size in (1, 2, 3, 4):
@@ -1255,7 +1235,14 @@ def test_glm_execution_callback_uses_fixed_gemm_batch_size(
             )
             assert torch.equal(results[batch_size], batch_expected)
 
-    assert fixed_batch_shapes == [(4, 3)] * 8
+        reversed_result = glm_53_tiered_execution_callback(
+            hidden_states.flip(0),
+            topk_weights.flip(0),
+            topk_ids.flip(0),
+            resident_experts.experts,
+        )
+        assert torch.equal(results[4].flip(0), reversed_result)
+
     for batch_size in (2, 3, 4):
         assert torch.equal(results[1][0], results[batch_size][0])
 
