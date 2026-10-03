@@ -196,14 +196,17 @@ def all_resident_reference(
     for expert_id in sorted(selected_experts):
         rows, slots = torch.nonzero(topk_ids == expert_id, as_tuple=True)
         weights = dequant_projection(experts[expert_id])
-        for row, slot in zip(rows.tolist(), slots.tolist()):
-            expert_input = hidden_states[row].to(torch.float32).unsqueeze(0)
-            gate_output = expert_input @ weights["gate_proj"].T
-            up_output = expert_input @ weights["up_proj"].T
-            intermediate = F.silu(gate_output) * up_output
-            expert_output = intermediate @ weights["down_proj"].T
-            routing_weight = topk_weights[row, slot].to(torch.float32)
-            output[row] += expert_output[0] * routing_weight
+        expert_input = hidden_states[rows].to(torch.float32)
+        gate_output = expert_input.unsqueeze(1) @ weights["gate_proj"].T
+        up_output = expert_input.unsqueeze(1) @ weights["up_proj"].T
+        intermediate = F.silu(gate_output) * up_output
+        expert_output = intermediate @ weights["down_proj"].T
+        routing_weights = topk_weights[rows, slots].to(torch.float32)
+        output.index_add_(
+            0,
+            rows,
+            expert_output.squeeze(1) * routing_weights.unsqueeze(1),
+        )
     return output.to(hidden_states.dtype)
 
 
@@ -700,7 +703,7 @@ def test_glm_execution_scratch_matches_parent_n32_dequant_peak():
     )
 
 
-def test_glm_execution_scratch_accounts_for_row_independent_gemm():
+def test_glm_execution_scratch_accounts_for_vectorized_row_independent_gemm():
     projection = TieredGlmProjection(
         expert_id=1,
         projection="gate_proj",
@@ -713,7 +716,9 @@ def test_glm_execution_scratch_accounts_for_row_independent_gemm():
 
     for batch_size in (1, 2, 3, 4):
         hidden_states = torch.empty((batch_size, 3), dtype=torch.bfloat16)
-        padded_activation_bytes = 4 * ((2 * batch_size + 2) * 3 + 3 * 2)
+        padded_activation_bytes = 4 * (
+            (2 * batch_size + 2 * batch_size) * 3 + 3 * batch_size * 2
+        )
         callback_activation_bytes = max(
             4 * batch_size * (5 * 3 + 3 * 2),
             padded_activation_bytes,
@@ -1195,8 +1200,7 @@ def test_glm_execution_callback_timings_preserve_exact_output_and_accumulate():
         assert second_metrics[count_name] >= first_metrics[count_name]
 
 
-def test_glm_execution_callback_is_row_independent(
-):
+def test_glm_execution_callback_uses_vectorized_row_independent_gemm():
     adapter, runtime, _, records, payload, _ = device_runtime_for_tiny_glm(
         max_resident_experts=3,
         slot_count=18,

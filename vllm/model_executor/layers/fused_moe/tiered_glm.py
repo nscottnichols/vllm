@@ -2133,14 +2133,15 @@ def glm_53_tiered_execution_callback(
         "routing_indexing",
         hidden_states.device,
     ):
-        selected_experts = {
-            int(expert_id)
-            for routing_row in topk_ids.tolist()
-            for expert_id in routing_row
-        }
-        if any(expert_id < 0 for expert_id in selected_experts):
+        selected_expert_tensor = torch.unique(topk_ids, sorted=True)
+        if bool((selected_expert_tensor < 0).any()):
             raise ValueError("Tiered GLM routing produced an invalid expert id")
-        if selected_experts != set(experts):
+        resident_expert_tensor = torch.as_tensor(
+            sorted(experts),
+            device=topk_ids.device,
+            dtype=topk_ids.dtype,
+        )
+        if not torch.equal(selected_expert_tensor, resident_expert_tensor):
             raise RuntimeError(
                 "Tiered GLM resident experts do not match router selection"
             )
@@ -2150,7 +2151,7 @@ def glm_53_tiered_execution_callback(
         dtype=torch.float32,
         device=hidden_states.device,
     )
-    for expert_id in sorted(selected_experts):
+    for expert_id in sorted(experts):
         with _timed_glm_execution_stage(
             timings,
             "routing_indexing",
@@ -2160,8 +2161,7 @@ def glm_53_tiered_execution_callback(
                 topk_ids == expert_id, as_tuple=True
             )
             projections = experts[expert_id]
-            expert_row_indices = expert_rows.tolist()
-            routing_slot_indices = routing_slots.tolist()
+            expert_input = hidden_states[expert_rows].to(torch.float32)
 
         with _timed_glm_execution_stage(
             timings,
@@ -2177,19 +2177,16 @@ def glm_53_tiered_execution_callback(
             "matmul_activation_accumulation",
             hidden_states.device,
         ):
-            for expert_row, routing_slot in zip(
-                expert_row_indices,
-                routing_slot_indices,
-            ):
-                expert_input = hidden_states[expert_row].to(torch.float32).unsqueeze(0)
-                gate_output = expert_input @ gate_weight.T
-                up_output = expert_input @ up_weight.T
-                intermediate = F.silu(gate_output) * up_output
-                expert_output = intermediate @ down_weight.T
-                routing_weight = topk_weights[expert_row, routing_slot].to(
-                    torch.float32
-                )
-                output[expert_row] += expert_output[0] * routing_weight
+            gate_output = expert_input.unsqueeze(1) @ gate_weight.T
+            up_output = expert_input.unsqueeze(1) @ up_weight.T
+            intermediate = F.silu(gate_output) * up_output
+            expert_output = intermediate @ down_weight.T
+            routing_weights = topk_weights[expert_rows, routing_slots].to(torch.float32)
+            output.index_add_(
+                0,
+                expert_rows,
+                expert_output.squeeze(1) * routing_weights.unsqueeze(1),
+            )
 
     return output.to(hidden_states.dtype)
 
@@ -2243,7 +2240,7 @@ def _glm_53_execution_scratch_bytes(
     gate_weight = next(iter(experts.values()))["gate_proj"].weight
     intermediate_size = gate_weight.shape[0]
     weight_elements = hidden_size * intermediate_size
-    gemm_rows = 1
+    gemm_rows = num_tokens
     padded_activation_bytes = 4 * (
         (2 * num_tokens + 2 * gemm_rows) * hidden_size
         + 3 * gemm_rows * intermediate_size
