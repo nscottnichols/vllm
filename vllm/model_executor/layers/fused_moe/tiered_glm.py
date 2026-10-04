@@ -98,6 +98,7 @@ class TieredGlmApplyTimings:
         "apply_total": "apply_total",
         "route_controller": "route_controller",
         "demand_build": "demand_build",
+        "current_layer_prefetch": "current_layer_prefetch",
         "row_partition": "row_partition",
         "provider_request": "apply_provider_request",
         "callback": "callback",
@@ -1899,7 +1900,10 @@ class TieredGlm53MoEMethod(FusedMoEMethodBase):
                             )
                         )
                     if prefetch_demands:
-                        prefetch_experts(prefetch_demands)
+                        with _timed_glm_apply_stage(
+                            apply_timings, "current_layer_prefetch", x.device
+                        ):
+                            prefetch_experts(prefetch_demands)
                 except Exception:
                     pass
 
@@ -1934,12 +1938,15 @@ class TieredGlm53MoEMethod(FusedMoEMethodBase):
                         raise RuntimeError(
                             "router produced no GLM 5.3 Tiered Weights demands"
                         )
-                    with (
-                        _timed_glm_apply_stage(
-                            apply_timings, "provider_request", x.device
-                        ),
-                        self._provider.request_experts(demands) as resident_experts,
-                    ):
+                    with ExitStack() as provider_context:
+                        provider_context.enter_context(
+                            _timed_glm_apply_stage(
+                                apply_timings, "provider_request", x.device
+                            )
+                        )
+                        resident_experts = provider_context.enter_context(
+                            self._provider.request_experts(demands)
+                        )
                         scratch_bytes = _glm_53_execution_scratch_bytes(
                             x[row_indices],
                             resident_experts.experts,

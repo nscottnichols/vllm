@@ -1298,9 +1298,13 @@ def test_glm_apply_timings_cover_every_diagnostic_bucket():
             self.route_controller = route_controller
             self.apply_timings = timings
             self.callback_calls = 0
+            self.enable_prefetch = True
 
         def request_experts(self, demands):
             return self._provider.request_experts(demands)
+
+        def prefetch_experts(self, demands):
+            return None
 
         def reserve_execution_scratch(self, scratch_bytes):
             return self._provider.reserve_execution_scratch(scratch_bytes)
@@ -1336,12 +1340,195 @@ def test_glm_apply_timings_cover_every_diagnostic_bucket():
     assert route_controller.apply_calls == [3]
     assert provider.callback_calls == 1
     metrics = provider.stats()
+    expected_counts = {
+        metric_name: 2 if metric_name == "demand_build" else 1
+        for metric_name in TieredGlmApplyTimings._STAGE_METRIC_NAMES.values()
+    }
     for metric_name in TieredGlmApplyTimings._STAGE_METRIC_NAMES.values():
-        assert metrics[f"{metric_name}_count"] == 1
+        assert metrics[f"{metric_name}_count"] == expected_counts[metric_name]
         assert metrics[f"{metric_name}_seconds"] >= 0.0
     assert "provider_request_seconds" not in metrics
     assert "provider_request_count" not in metrics
     assert runtime.stats()["active_leases"] == 0
+
+
+def test_glm_current_layer_prefetch_timing_covers_synchronous_call(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    adapter, runtime, _, records, payload, _ = device_runtime_for_tiny_glm(
+        device_budget_bytes=600,
+    )
+    timings = TieredGlmApplyTimings()
+    inner_provider = DeviceWeightRuntimeGlmTensorProvider(
+        runtime=runtime,
+        adapter=adapter,
+        apply_timings=timings,
+        enable_prefetch=True,
+    )
+    clock_calls: list[float] = []
+    event_clocks: dict[str, float] = {}
+
+    def fake_clock() -> float:
+        clock = 10.0 + 0.25 * len(clock_calls)
+        clock_calls.append(clock)
+        return clock
+
+    class PrefetchRecordingProvider:
+        def __init__(self, provider):
+            self._provider = provider
+            self.enable_prefetch = True
+            self.apply_timings = timings
+
+        def prefetch_experts(self, demands):
+            event_clocks["prefetch"] = fake_clock()
+            self._provider.prefetch_experts(demands)
+
+        def request_experts(self, demands):
+            return self._provider.request_experts(demands)
+
+        def reserve_execution_scratch(self, scratch_bytes):
+            return self._provider.reserve_execution_scratch(scratch_bytes)
+
+        def stats(self):
+            return self._provider.stats()
+
+    provider = PrefetchRecordingProvider(inner_provider)
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.fused_moe.tiered_glm.time",
+        SimpleNamespace(perf_counter=fake_clock),
+    )
+    method = TieredGlm53MoEMethod(SimpleNamespace(), provider=provider)
+    generator = torch.Generator().manual_seed(19753)
+    hidden_states = torch.randn((2, 3), generator=generator, dtype=torch.float32)
+    topk_weights = torch.tensor(
+        [[0.25, 0.75], [0.75, 0.25]],
+        dtype=torch.float32,
+    )
+    topk_ids = torch.tensor([[1, 2], [2, 1]], dtype=torch.int32)
+    expected = all_resident_reference(
+        hidden_states,
+        topk_weights,
+        topk_ids,
+        all_resident_experts(adapter, records, payload, (1, 2)),
+    )
+
+    result = method.apply(
+        layer=FakeRoutedExpertsLayer(),
+        x=hidden_states,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        shared_experts=None,
+        shared_experts_input=None,
+    )
+
+    prefetch_index = clock_calls.index(event_clocks["prefetch"])
+    start_index = prefetch_index - 1
+    end_index = prefetch_index + 1
+    assert torch.equal(result, expected)
+    assert (
+        timings.metrics()["current_layer_prefetch_seconds"]
+        == clock_calls[end_index] - clock_calls[start_index]
+    )
+    assert timings.metrics()["current_layer_prefetch_count"] == 1
+    assert inner_provider.stats()["prefetch_successes"] == 1
+    assert inner_provider.stats()["prefetch_failures"] == 0
+    assert runtime.stats()["active_leases"] == 0
+    assert runtime.stats()["scratch_bytes"] == 0
+
+
+def test_glm_provider_request_timing_covers_acquisition_and_release(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    adapter, runtime, _, records, payload, _ = device_runtime_for_tiny_glm(
+        device_budget_bytes=600,
+    )
+    timings = TieredGlmApplyTimings()
+    inner_provider = DeviceWeightRuntimeGlmTensorProvider(
+        runtime=runtime,
+        adapter=adapter,
+        apply_timings=timings,
+    )
+    clock_calls: list[float] = []
+    event_clocks: dict[str, float] = {}
+
+    def fake_clock() -> float:
+        clock = 20.0 + 0.25 * len(clock_calls)
+        clock_calls.append(clock)
+        return clock
+
+    class RecordedResidentExperts:
+        def __init__(self, resident_experts):
+            self._resident_experts = resident_experts
+            self.experts = resident_experts.experts
+
+        def __enter__(self):
+            event_clocks["request_enter"] = fake_clock()
+            self._resident_experts.__enter__()
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            self._resident_experts.__exit__(exc_type, exc, traceback)
+            event_clocks["request_released"] = fake_clock()
+
+    class RequestRecordingProvider:
+        def __init__(self, provider):
+            self._provider = provider
+            self.apply_timings = timings
+
+        def request_experts(self, demands):
+            event_clocks["request_call"] = fake_clock()
+            return RecordedResidentExperts(self._provider.request_experts(demands))
+
+        def reserve_execution_scratch(self, scratch_bytes):
+            return self._provider.reserve_execution_scratch(scratch_bytes)
+
+        def stats(self):
+            return self._provider.stats()
+
+    provider = RequestRecordingProvider(inner_provider)
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.fused_moe.tiered_glm.time",
+        SimpleNamespace(perf_counter=fake_clock),
+    )
+    method = TieredGlm53MoEMethod(SimpleNamespace(), provider=provider)
+    generator = torch.Generator().manual_seed(29741)
+    hidden_states = torch.randn((2, 3), generator=generator, dtype=torch.float32)
+    topk_weights = torch.tensor(
+        [[0.25, 0.75], [0.75, 0.25]],
+        dtype=torch.float32,
+    )
+    topk_ids = torch.tensor([[1, 2], [2, 1]], dtype=torch.int32)
+    expected = all_resident_reference(
+        hidden_states,
+        topk_weights,
+        topk_ids,
+        all_resident_experts(adapter, records, payload, (1, 2)),
+    )
+
+    result = method.apply(
+        layer=FakeRoutedExpertsLayer(),
+        x=hidden_states,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        shared_experts=None,
+        shared_experts_input=None,
+    )
+
+    request_call_index = clock_calls.index(event_clocks["request_call"])
+    request_released_index = clock_calls.index(event_clocks["request_released"])
+    start_index = request_call_index - 1
+    end_index = request_released_index + 1
+    assert torch.equal(result, expected)
+    assert clock_calls[start_index] < clock_calls[request_call_index]
+    assert clock_calls[request_released_index] < clock_calls[end_index]
+    assert (
+        timings.metrics()["apply_provider_request_seconds"]
+        == clock_calls[end_index] - clock_calls[start_index]
+    )
+    assert timings.metrics()["apply_provider_request_count"] == 1
+    assert runtime.stats()["active_leases"] == 0
+    assert runtime.stats()["scratch_bytes"] == 0
+    assert all(lease_set.released for lease_set in runtime.lease_sets)
 
 
 def test_glm_apply_timings_are_absent_when_diagnostics_are_disabled():
