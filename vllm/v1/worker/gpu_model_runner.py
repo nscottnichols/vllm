@@ -5470,6 +5470,16 @@ class GPUModelRunner(
                 self._moe_model = get_mixture_of_experts_model(self.model)
 
                 if (
+                    self.vllm_config.observability_config.enable_layerwise_nvtx_tracing
+                    and self.vllm_config.compilation_config.mode
+                    == CompilationMode.NONE
+                    and self.compilation_config.cudagraph_mode
+                    == CUDAGraphMode.NONE
+                    and not self.parallel_config.use_ubatching
+                ):
+                    self._register_layerwise_nvtx_hooks()
+
+                if (
                     self.parallel_config.enable_eplb
                     and not load_dummy_weights
                     and self._moe_model is not None

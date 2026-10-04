@@ -11,6 +11,7 @@ from vllm.config import (
     CompilationConfig,
     CompilationMode,
     CUDAGraphMode,
+    ObservabilityConfig,
     VllmConfig,
     set_current_vllm_config,
 )
@@ -159,6 +160,89 @@ def test_ignore_torch_compile_decorator(use_inductor_graph_partition, monkeypatc
         num_cudagraph_captured=expected_num_cudagraph_captured,
     ):
         run_model(vllm_config, mod_C, cudagraph_runtime_mode)
+
+
+def test_eager_layerwise_nvtx_invokes_module_hooks():
+    @support_torch_compile
+    class Probe(nn.Module):
+        def __init__(
+            self, *, vllm_config: VllmConfig, prefix: str = "", **kwargs
+        ) -> None:
+            super().__init__()
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return x + 1
+
+    def make_config(enable_layerwise: bool) -> VllmConfig:
+        return VllmConfig(
+            compilation_config=CompilationConfig(mode=CompilationMode.NONE),
+            observability_config=ObservabilityConfig(
+                enable_layerwise_nvtx_tracing=enable_layerwise
+            ),
+        )
+
+    with set_current_vllm_config(make_config(True)):
+        layerwise_model = Probe(vllm_config=make_config(True)).eval()
+    layerwise_calls = []
+    layerwise_model.register_forward_pre_hook(
+        lambda module, args, kwargs: layerwise_calls.append((module, args, kwargs)),
+        with_kwargs=True,
+    )
+    output = layerwise_model(torch.tensor([1.0]))
+    assert torch.equal(output, torch.tensor([2.0]))
+    assert len(layerwise_calls) == 1
+
+    with set_current_vllm_config(make_config(False)):
+        eager_model = Probe(vllm_config=make_config(False)).eval()
+    eager_calls = []
+    eager_model.register_forward_pre_hook(
+        lambda module, args, kwargs: eager_calls.append((module, args, kwargs)),
+        with_kwargs=True,
+    )
+    output = eager_model(torch.tensor([3.0]))
+    assert torch.equal(output, torch.tensor([4.0]))
+    assert eager_calls == []
+
+
+@pytest.mark.parametrize(
+    ("mode", "cudagraph_mode"),
+    [
+        (CompilationMode.STOCK_TORCH_COMPILE, CUDAGraphMode.NONE),
+        (CompilationMode.NONE, CUDAGraphMode.FULL),
+    ],
+)
+def test_non_eager_layerwise_nvtx_skips_module_hooks(mode, cudagraph_mode):
+    @support_torch_compile
+    class Probe(nn.Module):
+        def __init__(
+            self, *, vllm_config: VllmConfig, prefix: str = "", **kwargs
+        ) -> None:
+            super().__init__()
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return x + 1
+
+    config = VllmConfig(
+        compilation_config=CompilationConfig(
+            mode=mode,
+            cudagraph_mode=cudagraph_mode,
+        ),
+        observability_config=ObservabilityConfig(
+            enable_layerwise_nvtx_tracing=True
+        ),
+    )
+
+    with set_current_vllm_config(config):
+        model = Probe(vllm_config=config).eval()
+    calls = []
+    model.register_forward_pre_hook(
+        lambda module, args, kwargs: calls.append((module, args, kwargs)),
+        with_kwargs=True,
+    )
+    output = model(torch.tensor([1.0]))
+
+    assert torch.equal(output, torch.tensor([2.0]))
+    assert calls == []
 
 
 # Only enable torch.compile if

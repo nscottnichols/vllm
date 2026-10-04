@@ -19,6 +19,7 @@ from vllm.compilation.counter import compilation_counter
 from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
 from vllm.config import (
     CompilationMode,
+    CUDAGraphMode,
     VllmConfig,
     get_current_vllm_config,
     set_current_vllm_config,
@@ -503,7 +504,16 @@ def _support_torch_compile(
         # torch.compiler.is_compiling() means we are inside the compilation
         # e.g. TPU has the compilation logic in model runner, so we don't
         # need to compile the model inside.
-        if self.do_not_compile or torch.compiler.is_compiling():
+        if torch.compiler.is_compiling():
+            return self.forward(*args, **kwargs)
+
+        if self.do_not_compile:
+            if (
+                self.vllm_config.observability_config.enable_layerwise_nvtx_tracing
+                and self.compilation_config.mode == CompilationMode.NONE
+                and self.compilation_config.cudagraph_mode == CUDAGraphMode.NONE
+            ):
+                return torch.nn.Module.__call__(self, *args, **kwargs)
             return self.forward(*args, **kwargs)
 
         # If skip_compiled is set, bypass compiled model call. This is used e.g. for
