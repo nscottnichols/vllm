@@ -48,6 +48,13 @@ TieredGlmExecutionCallback = Callable[
 ]
 
 
+class TieredGlmApplyTimings:
+    """Compatibility no-op for the current profiling harness."""
+
+    def metrics(self) -> dict[str, float | int]:
+        return {}
+
+
 class TieredGlmExecutionTimings:
     """Thread-safe cumulative timing buckets for the GLM execution callback."""
 
