@@ -1150,6 +1150,13 @@ class DeviceWeightRuntimeGlmTensorProvider:
         self._close_dequant_cache()
 
     def reserve_execution_scratch(self, scratch_bytes: int):
+        reserve_execution_scratch = getattr(
+            self._runtime,
+            "reserve_execution_scratch",
+            None,
+        )
+        if callable(reserve_execution_scratch):
+            return reserve_execution_scratch(scratch_bytes)
         return self._runtime.reserve_scratch(scratch_bytes)
 
     def _reserve_dequant_scratch(self, scratch_bytes: int):
@@ -1483,6 +1490,7 @@ class TieredGlm53MoEMethod(FusedMoEMethodBase):
                     scratch_bytes = _glm_53_execution_scratch_bytes(
                         x[row_indices],
                         resident_experts.experts,
+                        include_output=False,
                     )
                     if callable(reserve_execution_scratch):
                         scratch_reservation = reserve_execution_scratch(scratch_bytes)
@@ -1751,6 +1759,8 @@ def _partition_rows_by_expert_union(
 def _glm_53_execution_scratch_bytes(
     hidden_states: torch.Tensor,
     experts: dict[int, dict[str, TieredGlmProjection]],
+    *,
+    include_output: bool = True,
 ) -> int:
     if hidden_states.ndim != 2 or not experts:
         raise ValueError(
@@ -1760,10 +1770,24 @@ def _glm_53_execution_scratch_bytes(
     gate_weight = next(iter(experts.values()))["gate_proj"].weight
     intermediate_size = gate_weight.shape[0]
     weight_elements = hidden_size * intermediate_size
-    return (
+    callback_reservation_bytes = (
         4 * num_tokens * (5 * hidden_size + 3 * intermediate_size)
         + 16 * weight_elements
     )
+    matmul_peak_bytes = (
+        20 * num_tokens * hidden_size
+        + 16 * num_tokens * intermediate_size
+        + 12 * weight_elements
+    )
+    dequant_peak_bytes = 21 * weight_elements
+    scratch_bytes = max(
+        callback_reservation_bytes,
+        matmul_peak_bytes,
+        dequant_peak_bytes,
+    )
+    if include_output:
+        scratch_bytes += 2 * num_tokens * hidden_size
+    return scratch_bytes
 
 
 def _dequant_glm_53_fp8_block(projection: TieredGlmProjection) -> torch.Tensor:

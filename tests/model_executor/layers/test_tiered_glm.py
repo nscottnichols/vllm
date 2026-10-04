@@ -45,6 +45,7 @@ from vllm.model_executor.layers.fused_moe.tiered_glm import (  # noqa: E402
     _timed_glm_execution_stage,
     configure_glm_53_tiered_experts,
     _dequant_glm_53_fp8_block,
+    _glm_53_execution_scratch_bytes,
     _partition_rows_by_expert_union,
     glm_53_tiered_execution_callback,
     glm_53_tiered_experts,
@@ -670,6 +671,35 @@ def test_partition_rows_by_expert_union_defaults_to_routing_width():
     ]
 
 
+def test_glm_execution_scratch_matches_parent_n32_dequant_peak():
+    projection = TieredGlmProjection(
+        expert_id=1,
+        projection="gate_proj",
+        weight=torch.empty((2048, 6144), dtype=torch.float8_e4m3fn),
+        weight_unit_id="gate_proj.weight",
+        scale=torch.empty((16, 48), dtype=torch.float32),
+        scale_unit_id="gate_proj.weight_scale_inv",
+    )
+    hidden_states = torch.empty((32, 6144), dtype=torch.bfloat16)
+
+    full_scratch_bytes = _glm_53_execution_scratch_bytes(
+        hidden_states,
+        {1: {"gate_proj": projection}},
+    )
+    nested_scratch_bytes = _glm_53_execution_scratch_bytes(
+        hidden_states,
+        {1: {"gate_proj": projection}},
+        include_output=False,
+    )
+
+    assert full_scratch_bytes == 264_634_368
+    assert nested_scratch_bytes == 264_241_152
+    assert (
+        full_scratch_bytes - nested_scratch_bytes
+        == hidden_states.numel() * hidden_states.element_size()
+    )
+
+
 def test_vllm_glm_path_batches_mixed_rows_up_to_provider_max_union():
     adapter, runtime, manifest, records, payload, _ = device_runtime_for_tiny_glm(
         expert_count=18,
@@ -754,6 +784,7 @@ def test_vllm_glm_path_consumes_chunk_output_before_release():
         def __init__(self, provider):
             self._provider = provider
             self._scratch_reservations = 0
+            self.scratch_sizes = []
 
         def request_experts(self, demands):
             events.append("request")
@@ -761,6 +792,7 @@ def test_vllm_glm_path_consumes_chunk_output_before_release():
 
         def reserve_execution_scratch(self, scratch_bytes):
             self._scratch_reservations += 1
+            self.scratch_sizes.append(scratch_bytes)
             label = (
                 "output-scratch"
                 if self._scratch_reservations == 1
@@ -827,6 +859,7 @@ def test_vllm_glm_path_consumes_chunk_output_before_release():
     )
 
     assert torch.equal(result, expected)
+    assert provider.scratch_sizes == [12, 264]
     assert events == [
         "output-scratch-enter",
         "request",
@@ -1151,6 +1184,50 @@ def test_glm_execution_timing_synchronizes_cuda_stages(monkeypatch: pytest.Monke
     assert synchronized_devices == [cuda_device, cuda_device]
     assert timings.metrics()["routing_indexing_count"] == 1
     assert timings.metrics()["routing_indexing_seconds"] >= 0.0
+
+
+def test_glm_provider_prefers_execution_scratch_api():
+    class Runtime:
+        def __init__(self):
+            self.execution_calls = []
+            self.legacy_calls = []
+
+        def reserve_execution_scratch(self, scratch_bytes):
+            self.execution_calls.append(scratch_bytes)
+            return "execution-reservation"
+
+        def reserve_scratch(self, scratch_bytes):
+            self.legacy_calls.append(scratch_bytes)
+            return "legacy-reservation"
+
+    runtime = Runtime()
+    provider = DeviceWeightRuntimeGlmTensorProvider(
+        runtime=runtime,
+        adapter=SimpleNamespace(),
+    )
+
+    assert provider.reserve_execution_scratch(123) == "execution-reservation"
+    assert runtime.execution_calls == [123]
+    assert runtime.legacy_calls == []
+
+
+def test_glm_provider_reserve_execution_scratch_falls_back_to_legacy_runtime():
+    class LegacyRuntime:
+        def __init__(self):
+            self.legacy_calls = []
+
+        def reserve_scratch(self, scratch_bytes):
+            self.legacy_calls.append(scratch_bytes)
+            return "legacy-reservation"
+
+    runtime = LegacyRuntime()
+    provider = DeviceWeightRuntimeGlmTensorProvider(
+        runtime=runtime,
+        adapter=SimpleNamespace(),
+    )
+
+    assert provider.reserve_execution_scratch(123) == "legacy-reservation"
+    assert runtime.legacy_calls == [123]
 
 
 def test_glm_fp8_block_dequantization_aligned_fast_path_is_exact():
