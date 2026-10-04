@@ -1436,6 +1436,54 @@ def test_glm_current_layer_prefetch_timing_covers_synchronous_call(
     assert runtime.stats()["scratch_bytes"] == 0
 
 
+def test_glm_derived_cache_skips_current_layer_prefetch():
+    adapter, runtime, _, records, payload, _ = device_runtime_for_tiny_glm(
+        device_budget_bytes=600,
+    )
+    timings = TieredGlmApplyTimings()
+    provider = DeviceWeightRuntimeGlmTensorProvider(
+        runtime=runtime,
+        adapter=adapter,
+        apply_timings=timings,
+        enable_prefetch=True,
+        device_cache_budget_bytes=600,
+    )
+
+    def fail_prefetch(demands):
+        raise AssertionError("derived-cache path must not prefetch before request")
+
+    provider.prefetch_experts = fail_prefetch
+    method = TieredGlm53MoEMethod(SimpleNamespace(), provider=provider)
+    generator = torch.Generator().manual_seed(24680)
+    hidden_states = torch.randn((2, 3), generator=generator, dtype=torch.float32)
+    topk_weights = torch.tensor(
+        [[0.25, 0.75], [0.75, 0.25]],
+        dtype=torch.float32,
+    )
+    topk_ids = torch.tensor([[1, 2], [2, 1]], dtype=torch.int32)
+    expected = all_resident_reference(
+        hidden_states,
+        topk_weights,
+        topk_ids,
+        all_resident_experts(adapter, records, payload, (1, 2)),
+    )
+
+    result = method.apply(
+        layer=FakeRoutedExpertsLayer(),
+        x=hidden_states,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        shared_experts=None,
+        shared_experts_input=None,
+    )
+
+    assert torch.equal(result, expected)
+    assert provider.uses_derived_cache is True
+    assert timings.metrics()["current_layer_prefetch_count"] == 0
+    assert provider.stats()["prefetch_successes"] == 0
+    assert runtime.stats()["active_leases"] == 0
+
+
 def test_glm_provider_request_timing_covers_acquisition_and_release(
     monkeypatch: pytest.MonkeyPatch,
 ):

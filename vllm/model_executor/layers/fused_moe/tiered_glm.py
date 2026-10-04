@@ -1251,6 +1251,13 @@ class DeviceWeightRuntimeGlmTensorProvider:
         )
         self._dequant_cache_closed = False
 
+    @property
+    def uses_derived_cache(self) -> bool:
+        return (
+            self._device_cache_budget_bytes is not None
+            or self._dequant_cache_budget_bytes is not None
+        )
+
     def request_experts(self, demands: Sequence[Any]) -> TieredGlmResidentExperts:
         if not demands:
             raise ValueError("Tiered GLM demands must not be empty")
@@ -1887,7 +1894,7 @@ class TieredGlm53MoEMethod(FusedMoEMethodBase):
             prefetch_experts = getattr(self._provider, "prefetch_experts", None)
             if getattr(self._provider, "enable_prefetch", False) and callable(
                 prefetch_experts
-            ):
+            ) and not getattr(self._provider, "uses_derived_cache", False):
                 try:
                     with _timed_glm_apply_stage(
                         apply_timings, "demand_build", x.device
