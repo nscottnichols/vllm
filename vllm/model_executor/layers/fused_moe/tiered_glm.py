@@ -1947,6 +1947,18 @@ class DeviceWeightRuntimeGlmTensorProvider:
 
     def stats(self) -> dict[str, int | float | str | None]:
         stats = dict(self._runtime.stats())
+        callback_stats_method = getattr(self.execution_callback, "stats", None)
+        if callable(callback_stats_method):
+            callback_stats = callback_stats_method()
+            if not isinstance(callback_stats, dict):
+                raise RuntimeError("Tiered GLM execution callback stats must be a dict")
+            overlapping_keys = [key for key in stats if key in callback_stats]
+            if overlapping_keys:
+                raise RuntimeError(
+                    "Tiered GLM execution callback stats overlap runtime stats: "
+                    f"{overlapping_keys}"
+                )
+            stats.update(callback_stats)
         if self.apply_timings is not None:
             stats.update(self.apply_timings.metrics())
         with self._prefetch_stats_lock:

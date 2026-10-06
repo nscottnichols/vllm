@@ -2006,6 +2006,40 @@ def test_glm_apply_timings_are_absent_when_diagnostics_are_disabled():
     )
 
 
+def test_glm_provider_stats_merges_callback_stats_and_rejects_overlap():
+    class Runtime:
+        def stats(self):
+            return {"runtime_count": 1}
+
+    class ExecutionCallback:
+        def __init__(self, stats):
+            self._stats = stats
+
+        def __call__(self):
+            raise AssertionError("callback execution is not required")
+
+        def stats(self):
+            return self._stats
+
+    provider = DeviceWeightRuntimeGlmTensorProvider(
+        runtime=Runtime(),
+        adapter=object(),
+        execution_callback=ExecutionCallback(
+            {"verification_calls": 3, "fused_calls": 2, "fallback_calls": 1}
+        ),
+    )
+
+    stats = provider.stats()
+    assert stats["runtime_count"] == 1
+    assert stats["verification_calls"] == 3
+    assert stats["fused_calls"] == 2
+    assert stats["fallback_calls"] == 1
+
+    provider.execution_callback = ExecutionCallback({"runtime_count": 4})
+    with pytest.raises(RuntimeError, match="overlap runtime stats"):
+        provider.stats()
+
+
 def test_glm_apply_timing_synchronizes_cuda_boundaries_only_when_enabled(
     monkeypatch: pytest.MonkeyPatch,
 ):
