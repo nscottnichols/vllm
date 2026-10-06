@@ -9,7 +9,8 @@ import re
 import threading
 import time
 from collections import Counter, OrderedDict, deque
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass, replace
 from typing import Any, Protocol, cast
@@ -42,11 +43,48 @@ class TieredGlmProjection:
     dequantized_weight: torch.Tensor | None = None
 
 
+@dataclass(slots=True)
+class _EagerRouteReplayPrefetch:
+    layer_id: int
+    tensor_specs: tuple[TieredGlmTensorSpec, ...]
+    future: Future[list[torch.Tensor]]
+
+    @property
+    def byte_count(self) -> int:
+        return sum(
+            math.prod(spec[1])
+            * torch.empty((), dtype=spec[2]).element_size()
+            for spec in self.tensor_specs
+        )
+
+
 TieredGlmExpertProjections = dict[int, dict[str, TieredGlmProjection]]
 TieredGlmExecutionCallback = Callable[
     [torch.Tensor, torch.Tensor, torch.Tensor, TieredGlmExpertProjections],
     torch.Tensor,
 ]
+TieredGlmTensorSpec = tuple[str, tuple[int, ...], torch.dtype]
+TieredGlmBatchedTensorFactory = Callable[
+    [Sequence[TieredGlmTensorSpec]],
+    "TieredGlmBatchedTensors | Sequence[torch.Tensor] | None",
+]
+
+
+class TieredGlmBatchedTensors(list[torch.Tensor]):
+    def __init__(
+        self,
+        tensors: Iterable[torch.Tensor],
+        *,
+        batch_count: int,
+    ) -> None:
+        super().__init__(tensors)
+        if (
+            type(batch_count) is not int
+            or batch_count <= 0
+            or batch_count > len(self)
+        ):
+            raise ValueError("invalid Tiered GLM materialization batch count")
+        self.batch_count = batch_count
 
 
 class TieredGlmExecutionTimings:
@@ -385,6 +423,7 @@ class TieredGlmPreviousTokenLayerPredictor:
 _GLM_53_WEIGHT_BLOCK_SIZE = (128, 128)
 _GLM_53_FIRST_SPARSE_LAYER = 3
 _GLM_53_LAST_SPARSE_LAYER = 77
+_GLM_53_MTP_LAYER = 78
 _GLM_EXPERT_UNIT_ID_PATTERN = re.compile(
     r"^model\.layers\.(?P<layer_id>\d+)\.mlp\.experts\."
     r"(?P<expert_id>\d+)\.(?P<projection>gate_proj|up_proj|down_proj)\."
@@ -605,6 +644,22 @@ class TieredGlmRouteController:
             self._capture_sample_active = True
             self._capture_ids = {}
             self._capture_weights = {}
+
+    def peek_layer_expert_ids(self, layer_id: int) -> tuple[int, ...] | None:
+        with self._lock:
+            if self._mode != "replay" or self._replay_ids is None:
+                raise RuntimeError("Tiered GLM route replay mode is not active")
+            layer_offset = layer_id - _GLM_53_FIRST_SPARSE_LAYER
+            if not 0 <= layer_offset < self._layer_count:
+                return None
+            selected_experts = {
+                int(expert_id)
+                for row in self._replay_ids.tolist()
+                for expert_id in row[layer_offset]
+            }
+            if not selected_experts:
+                raise RuntimeError(f"Tiered GLM replay layer {layer_id} has no experts")
+            return tuple(sorted(selected_experts))
 
     def finish_capture_sample(self) -> tuple[torch.Tensor, torch.Tensor]:
         with self._lock:
@@ -989,12 +1044,32 @@ class EagerSelectedExpertsGlmTensorProvider:
         *,
         adapter: Any,
         tensor_factory: Callable[[str], torch.Tensor],
+        batched_tensor_factory: TieredGlmBatchedTensorFactory | None = None,
         execution_callback: TieredGlmExecutionCallback | None = None,
+        enable_route_replay_next_layer_prefetch: bool = False,
     ) -> None:
         self._adapter = adapter
         self._tensor_factory = tensor_factory
+        self._batched_tensor_factory = batched_tensor_factory
         self.execution_callback = execution_callback
+        self.enable_route_replay_next_layer_prefetch = (
+            enable_route_replay_next_layer_prefetch
+        )
         self._lock = threading.RLock()
+        self._prefetch_lock = threading.RLock()
+        self._prefetch_executor = (
+            ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="glm-route-replay-prefetch",
+            )
+            if enable_route_replay_next_layer_prefetch
+            else None
+        )
+        self._route_replay_prefetch: _EagerRouteReplayPrefetch | None = None
+        self._route_replay_prefetch_requests = 0
+        self._route_replay_prefetch_hits = 0
+        self._route_replay_prefetch_failures = 0
+        self._route_replay_prefetch_fallbacks = 0
         self._active_unit_counts: Counter[str] = Counter()
         self._active_expert_counts: Counter[tuple[int, int]] = Counter()
         self._active_bytes = 0
@@ -1002,6 +1077,112 @@ class EagerSelectedExpertsGlmTensorProvider:
         self._requests = 0
         self._loads = 0
         self._read_bytes = 0
+        self._materialization_batches = 0
+        self._fallback_unit_loads = 0
+        self._provider_materialization_seconds = 0.0
+
+    def prefetch_route_replay_next_layer_experts(
+        self,
+        layer_id: int,
+        topk_ids: torch.Tensor,
+    ) -> None:
+        if not self.enable_route_replay_next_layer_prefetch:
+            return
+        del topk_ids
+
+        route_controller = getattr(self, "route_controller", None)
+        peek_layer_expert_ids = getattr(route_controller, "peek_layer_expert_ids", None)
+        if not callable(peek_layer_expert_ids):
+            self._record_route_replay_prefetch_failure()
+            raise RuntimeError(
+                "Tiered GLM deterministic route replay prefetch requires a route "
+                "controller"
+            )
+
+        next_layer_id = layer_id + 1
+        next_expert_ids = peek_layer_expert_ids(next_layer_id)
+        if next_expert_ids is None:
+            return
+
+        tensor_specs = tuple(
+            self._ordered_tensor_specs(
+                {(next_layer_id, expert_id) for expert_id in next_expert_ids},
+                next_layer_id,
+            )
+        )
+        with self._prefetch_lock:
+            if self._route_replay_prefetch is not None:
+                self._record_route_replay_prefetch_failure()
+                raise RuntimeError(
+                    "Tiered GLM deterministic route replay already has an active "
+                    "next-layer prefetch"
+                )
+            assert self._prefetch_executor is not None
+            self._route_replay_prefetch = _EagerRouteReplayPrefetch(
+                layer_id=next_layer_id,
+                tensor_specs=tensor_specs,
+                future=self._prefetch_executor.submit(
+                    self._materialize_tensors,
+                    tensor_specs,
+                ),
+            )
+            self._route_replay_prefetch_requests += 1
+
+    def _record_route_replay_prefetch_failure(self) -> None:
+        with self._prefetch_lock:
+            self._route_replay_prefetch_failures += 1
+
+    def _consume_route_replay_prefetch(
+        self,
+        layer_id: int,
+        requested_units: set[str],
+    ) -> dict[str, torch.Tensor]:
+        if not self.enable_route_replay_next_layer_prefetch:
+            return {}
+
+        with self._prefetch_lock:
+            prefetch = self._route_replay_prefetch
+            if prefetch is None or prefetch.layer_id != layer_id:
+                if layer_id == _GLM_53_FIRST_SPARSE_LAYER:
+                    return {}
+                self._route_replay_prefetch_fallbacks += 1
+                raise RuntimeError(
+                    "Tiered GLM deterministic route replay prefetch was missing for "
+                    f"layer {layer_id}"
+                )
+            if {spec[0] for spec in prefetch.tensor_specs} != requested_units:
+                self._route_replay_prefetch_fallbacks += 1
+                raise RuntimeError(
+                    "Tiered GLM deterministic route replay prefetch does not match "
+                    f"the layer-{layer_id} expert demand"
+                )
+
+        try:
+            tensors = prefetch.future.result()
+        except Exception:
+            self._record_route_replay_prefetch_failure()
+            raise
+
+        with self._prefetch_lock:
+            if self._route_replay_prefetch is not prefetch:
+                self._route_replay_prefetch_fallbacks += 1
+                raise RuntimeError("Tiered GLM route replay prefetch state changed")
+            self._route_replay_prefetch = None
+            self._route_replay_prefetch_hits += 1
+        return {
+            spec[0]: tensor
+            for spec, tensor in zip(prefetch.tensor_specs, tensors, strict=True)
+        }
+
+    def drain_prefetches(self) -> None:
+        with self._prefetch_lock:
+            prefetch = self._route_replay_prefetch
+        if prefetch is not None:
+            try:
+                prefetch.future.result()
+            except Exception:
+                self._record_route_replay_prefetch_failure()
+                raise
 
     def request_experts(self, demands: Sequence[Any]) -> TieredGlmResidentExperts:
         if not demands:
@@ -1031,13 +1212,23 @@ class EagerSelectedExpertsGlmTensorProvider:
             requested_units,
         )
 
-        tensors = {
-            unit_id: self._materialize(unit_id, expected_shape, expected_dtype)
-            for unit_id, expected_shape, expected_dtype in self._ordered_tensor_specs(
-                selected_experts,
-                layer_id,
-            )
-        }
+        tensor_specs = self._ordered_tensor_specs(selected_experts, layer_id)
+        prefetched_tensors = self._consume_route_replay_prefetch(
+            layer_id,
+            requested_units,
+        )
+        tensors = (
+            prefetched_tensors
+            if prefetched_tensors
+            else {
+                spec[0]: tensor
+                for spec, tensor in zip(
+                    tensor_specs,
+                    self._materialize_tensors(tensor_specs),
+                    strict=True,
+                )
+            }
+        )
         experts = self._build_experts(selected_experts, tensors, layer_id)
         with self._lock:
             self._requests += 1
@@ -1064,8 +1255,36 @@ class EagerSelectedExpertsGlmTensorProvider:
         return TieredGlmResidentExperts(experts, release)
 
     def stats(self) -> dict[str, int | float | str | bool]:
+        with self._prefetch_lock:
+            route_replay_prefetch = self._route_replay_prefetch
+            route_replay_stats = {
+                "route_replay_next_layer_prefetch_enabled": (
+                    self.enable_route_replay_next_layer_prefetch
+                ),
+                "route_replay_next_layer_prefetch_requests": (
+                    self._route_replay_prefetch_requests
+                ),
+                "route_replay_next_layer_prefetch_hits": (
+                    self._route_replay_prefetch_hits
+                ),
+                "route_replay_next_layer_prefetch_failures": (
+                    self._route_replay_prefetch_failures
+                ),
+                "route_replay_next_layer_prefetch_fallbacks": (
+                    self._route_replay_prefetch_fallbacks
+                ),
+                "route_replay_next_layer_prefetch_active": (
+                    route_replay_prefetch is not None
+                ),
+                "route_replay_next_layer_prefetch_bytes": (
+                    route_replay_prefetch.byte_count
+                    if route_replay_prefetch is not None
+                    else 0
+                ),
+            }
         with self._lock:
             return {
+                **route_replay_stats,
                 "provider": "eager-selected-experts",
                 "paging": False,
                 "bounded_eviction": False,
@@ -1077,10 +1296,12 @@ class EagerSelectedExpertsGlmTensorProvider:
                 "requests": self._requests,
                 "loads": self._loads,
                 "storage_read_bytes": self._read_bytes,
+                "materialization_batches": self._materialization_batches,
+                "materialization_fallback_loads": self._fallback_unit_loads,
+                "provider_materialization_seconds": (
+                    self._provider_materialization_seconds
+                ),
             }
-
-    def drain_prefetches(self) -> None:
-        return None
 
     def _ordered_tensor_specs(
         self,
@@ -1122,10 +1343,95 @@ class EagerSelectedExpertsGlmTensorProvider:
                 f"Tiered GLM unit {unit_id!r} changed shape: "
                 f"{tuple(tensor.shape)} != {expected_shape}"
             )
-        with self._lock:
-            self._loads += 1
-            self._read_bytes += tensor.numel() * tensor.element_size()
         return tensor
+
+    def _materialize_tensors(
+        self,
+        tensor_specs: Sequence[TieredGlmTensorSpec],
+    ) -> list[torch.Tensor]:
+        started = time.perf_counter()
+        tensors: list[torch.Tensor] | None = None
+        materialization_batch = False
+        materialization_batch_count = 0
+        materialized = False
+        try:
+            if self._batched_tensor_factory is not None:
+                returned_tensors = self._batched_tensor_factory(tensor_specs)
+                if returned_tensors is not None:
+                    tensors = self._validate_batched_tensors(
+                        tensor_specs,
+                        returned_tensors,
+                    )
+                    materialization_batch = True
+                    materialization_batch_count = (
+                        returned_tensors.batch_count
+                        if isinstance(returned_tensors, TieredGlmBatchedTensors)
+                        else 1
+                    )
+            if tensors is None:
+                tensors = [
+                    self._materialize(
+                        unit_id,
+                        expected_shape,
+                        expected_dtype,
+                    )
+                    for unit_id, expected_shape, expected_dtype in tensor_specs
+                ]
+            materialized = True
+        finally:
+            elapsed_seconds = time.perf_counter() - started
+            with self._lock:
+                self._provider_materialization_seconds += elapsed_seconds
+                if materialized:
+                    tensor_count = len(tensors) if tensors is not None else 0
+                    if materialization_batch:
+                        self._materialization_batches += materialization_batch_count
+                    else:
+                        self._fallback_unit_loads += tensor_count
+                    self._loads += tensor_count
+                    self._read_bytes += sum(
+                        self._tensor_byte_size(tensor)
+                        for tensor in tensors or []
+                    )
+        if tensors is None:
+            raise RuntimeError("Tiered GLM materialization did not produce tensors")
+        return tensors
+
+    def _validate_batched_tensors(
+        self,
+        tensor_specs: Sequence[TieredGlmTensorSpec],
+        returned_tensors: Sequence[torch.Tensor],
+    ) -> list[torch.Tensor]:
+        if not isinstance(returned_tensors, Sequence):
+            raise TypeError(
+                "Tiered GLM batched tensor factory must return a tensor sequence"
+            )
+        tensors = list(returned_tensors)
+        if len(tensors) != len(tensor_specs):
+            raise ValueError(
+                "Tiered GLM batched tensor factory returned "
+                f"{len(tensors)} tensors; expected {len(tensor_specs)}"
+            )
+        for tensor, (unit_id, expected_shape, expected_dtype) in zip(
+            tensors,
+            tensor_specs,
+            strict=True,
+        ):
+            if not isinstance(tensor, torch.Tensor):
+                raise TypeError(
+                    f"Tiered GLM unit {unit_id!r} is not a tensor: {type(tensor)!r}"
+                )
+            if tensor.dtype != expected_dtype:
+                raise TypeError(
+                    f"Tiered GLM unit {unit_id!r} changed dtype: "
+                    f"{tensor.dtype} != {expected_dtype}"
+                )
+            if tuple(tensor.shape) != expected_shape:
+                raise ValueError(
+                    f"Tiered GLM unit {unit_id!r} changed shape: "
+                    f"{tuple(tensor.shape)} != {expected_shape}"
+                )
+        return tensors
 
     @staticmethod
     def _expected_dtype(native_dtype: str) -> torch.dtype:
@@ -1415,6 +1721,16 @@ class DeviceWeightRuntimeGlmTensorProvider:
         with self._prefetch_stats_lock:
             self._prefetch_successes += 1
 
+    def begin_sequence_turn(self) -> None:
+        begin_sequence_turn = getattr(
+            self._runtime,
+            "begin_sequence_turn",
+            None,
+        )
+        if not callable(begin_sequence_turn):
+            raise ValueError("Tiered GLM runtime does not support sequence turns")
+        begin_sequence_turn()
+
     def prefetch_next_layer_experts(
         self,
         layer_id: int,
@@ -1579,6 +1895,42 @@ class DeviceWeightRuntimeGlmTensorProvider:
         if callable(close_prefetches):
             close_prefetches(wait=wait)
         self._close_dequant_cache()
+
+    def clear(self) -> None:
+        runtime_stats = self._runtime.stats()
+        if runtime_stats.get("active_leases", 0) != 0:
+            raise RuntimeError(
+                "cannot clear Tiered GLM provider with active runtime leases: "
+                f"{runtime_stats['active_leases']}"
+            )
+        dequant_stats = self._dequant_cache.stats()
+        if dequant_stats.get("dequant_cache_active_leases", 0) != 0:
+            raise RuntimeError(
+                "cannot clear Tiered GLM provider with active derived-cache leases: "
+                f"{dequant_stats['dequant_cache_active_leases']}"
+            )
+        with self._device_cache_lock:
+            if self._device_cache_active_leases != 0:
+                raise RuntimeError(
+                    "cannot clear Tiered GLM provider with active device-cache leases: "
+                    f"{self._device_cache_active_leases}"
+                )
+
+        self.drain_prefetches()
+        self.close_prefetches(wait=True)
+        with self._device_cache_lock:
+            if self._device_cache_active_leases != 0:
+                raise RuntimeError(
+                    "cannot clear Tiered GLM provider with active device-cache leases: "
+                    f"{self._device_cache_active_leases}"
+                )
+            while self._device_cache:
+                cache_key = next(iter(self._device_cache))
+                self._remove_cached_projection(cache_key)
+
+        runtime_clear = getattr(self._runtime, "clear", None)
+        if callable(runtime_clear):
+            runtime_clear()
 
     def reserve_execution_scratch(self, scratch_bytes: int):
         reserve_execution_scratch = getattr(
@@ -1954,6 +2306,16 @@ class TieredGlm53MoEMethod(FusedMoEMethodBase):
                         resident_experts = provider_context.enter_context(
                             self._provider.request_experts(demands)
                         )
+                        route_replay_prefetch = getattr(
+                            self._provider,
+                            "prefetch_route_replay_next_layer_experts",
+                            None,
+                        )
+                        if callable(route_replay_prefetch):
+                            route_replay_prefetch(
+                                _parse_glm_layer_id(layer.layer_name),
+                                topk_ids,
+                            )
                         scratch_bytes = _glm_53_execution_scratch_bytes(
                             x[row_indices],
                             resident_experts.experts,
@@ -2019,21 +2381,7 @@ class TieredGlm53MoEMethod(FusedMoEMethodBase):
             return
 
     def _provider_max_expert_union(self, experts_per_token: int) -> int:
-        stats_method = getattr(self._provider, "stats", None)
-        if not callable(stats_method):
-            return experts_per_token
-
-        provider_stats = stats_method()
-        if not isinstance(provider_stats, Mapping):
-            raise ValueError("Tiered GLM provider stats must be a mapping")
-        max_expert_union = provider_stats.get("max_resident_experts")
-        if max_expert_union is None:
-            return experts_per_token
-        if type(max_expert_union) is not int or max_expert_union <= 0:
-            raise ValueError(
-                "Tiered GLM provider max_resident_experts must be a positive integer"
-            )
-        return max_expert_union
+        return experts_per_token
 
     def apply_monolithic(
         self,
@@ -2345,12 +2693,22 @@ def _is_glm_53(config: Any, prefix: str) -> bool:
         layer_index = prefix_parts[prefix_parts.index("layers") + 1]
     except (ValueError, IndexError):
         return False
+    if not layer_index.isdigit():
+        return False
+    layer_id = int(layer_index)
+    model_type = getattr(config, "model_type", None)
+    if model_type == "glm_moe_dsa":
+        valid_layer = (
+            _GLM_53_FIRST_SPARSE_LAYER <= layer_id <= _GLM_53_LAST_SPARSE_LAYER
+        )
+    elif model_type == "deepseek_mtp":
+        valid_layer = layer_id == _GLM_53_MTP_LAYER
+    else:
+        valid_layer = False
     return (
-        getattr(config, "model_type", None) == "glm_moe_dsa"
+        valid_layer
         and getattr(config, "n_routed_experts", None) == 256
         and getattr(config, "num_experts_per_tok", None) == 8
         and getattr(config, "hidden_size", None) == 6144
         and getattr(config, "moe_intermediate_size", None) == 2048
-        and layer_index.isdigit()
-        and _GLM_53_FIRST_SPARSE_LAYER <= int(layer_index) <= _GLM_53_LAST_SPARSE_LAYER
     )

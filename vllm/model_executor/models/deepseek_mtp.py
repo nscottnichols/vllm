@@ -35,6 +35,7 @@ from .deepseek_v2 import (
     DeepseekV2DecoderLayer,
     DeepseekV2MixtureOfExperts,
     DeepseekV2MoE,
+    _is_tiered_routed_expert_weight,
     _try_load_fp8_indexer_wk,
 )
 from .utils import (
@@ -317,6 +318,15 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
 
         pp_missing_layer_names = get_pp_missing_layer_names(self)
         params_dict = dict(self.named_parameters())
+        tiered_routed_expert_layer_ids = {
+            int(layer_idx)
+            for layer_idx, layer in self.model.layers.items()
+            if getattr(
+                getattr(getattr(layer, "mtp_block", None), "mlp", None),
+                "use_tiered_routed_experts",
+                False,
+            )
+        }
         loaded_params: set[str] = set()
         _pending_wk_fp8: dict = {}  # FP8 indexer wk dequant buffer
         for name, loaded_weight in weights:
@@ -324,6 +334,14 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
                 continue
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
             if spec_layer is None:
+                continue
+            if spec_layer in tiered_routed_expert_layer_ids and (
+                _is_tiered_routed_expert_weight(
+                    name,
+                    tiered_routed_expert_layer_ids,
+                    self.config.n_routed_experts,
+                )
+            ):
                 continue
             is_fusion_moe_shared_experts_layer = (
                 rocm_aiter_moe_shared_expert_enabled and ("mlp.shared_experts" in name)

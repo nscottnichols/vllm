@@ -7,6 +7,7 @@ from __future__ import annotations
 import hashlib
 import math
 import sys
+import threading
 from concurrent.futures import Future
 from contextlib import contextmanager
 from pathlib import Path
@@ -83,6 +84,20 @@ def tiny_glm_manifest(
             record["length_bytes"] = 4
         record["offset_bytes"] = offset_bytes
         offset_bytes += (record["length_bytes"] + 7) // 8 * 8
+    return manifest
+
+
+def tiny_glm_mtp_manifest(expert_count: int = 10) -> dict[str, object]:
+    manifest = tiny_glm_manifest(layer_ids=(3,), expert_count=expert_count)
+    manifest["layer_ids"] = [78]
+    for record in manifest["records"]:
+        for field_name in ("unit_id", "scale_unit_id", "weight_unit_id"):
+            field_value = record.get(field_name)
+            if isinstance(field_value, str):
+                record[field_name] = field_value.replace(
+                    "model.layers.3.",
+                    "model.layers.78.",
+                )
     return manifest
 
 
@@ -312,6 +327,273 @@ def test_router_demands_group_by_token_and_provider_materializes_only_selection(
         )
 
 
+def test_eager_selected_experts_batched_factory_preserves_exact_output():
+    manifest = tiny_glm_manifest(layer_ids=(3,))
+    payload = manifest_payload(manifest)
+    adapter = Glm53Adapter(manifest)
+    records = {record["unit_id"]: record for record in manifest["records"]}
+    create_tensor, created_tensors = payload_tensor_factory(records, payload)
+    batch_calls: list[tuple[str, ...]] = []
+
+    def create_tensors(tensor_specs):
+        batch_calls.append(tuple(spec[0] for spec in tensor_specs))
+        return [create_tensor(spec[0]) for spec in tensor_specs]
+
+    provider = EagerSelectedExpertsGlmTensorProvider(
+        adapter=adapter,
+        tensor_factory=create_tensor,
+        batched_tensor_factory=create_tensors,
+    )
+    method = TieredGlm53MoEMethod(SimpleNamespace(), provider=provider)
+    generator = torch.Generator().manual_seed(246)
+    hidden_states = torch.randn((2, 3), generator=generator, dtype=torch.bfloat16)
+    topk_weights = torch.tensor([[0.25, 0.75], [0.75, 0.25]], dtype=torch.float32)
+    topk_ids = torch.tensor([[1, 2], [2, 1]], dtype=torch.int32)
+    expected = all_resident_reference(
+        hidden_states,
+        topk_weights,
+        topk_ids,
+        all_resident_experts(adapter, records, payload, (1, 2)),
+    )
+
+    result = method.apply(
+        layer=FakeRoutedExpertsLayer(),
+        x=hidden_states,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        shared_experts=None,
+        shared_experts_input=None,
+    )
+    stats = provider.stats()
+
+    assert torch.allclose(result, expected, rtol=0.0, atol=0.0)
+    assert len(batch_calls) == 1
+    assert len(batch_calls[0]) == 12
+    assert len(created_tensors) == 12
+    assert stats["requests"] == 1
+    assert stats["loads"] == 12
+    assert stats["materialization_batches"] == 1
+    assert stats["materialization_fallback_loads"] == 0
+    assert stats["storage_read_bytes"] == sum(
+        tensor.numel() * tensor.element_size() for tensor in created_tensors.values()
+    )
+    assert stats["provider_materialization_seconds"] >= 0.0
+    assert stats["active_leases"] == 0
+    assert stats["resident_bytes"] == 0
+
+
+def test_eager_selected_experts_batched_factory_falls_back_when_declined():
+    manifest = tiny_glm_manifest(layer_ids=(3,))
+    payload = manifest_payload(manifest)
+    adapter = Glm53Adapter(manifest)
+    records = {record["unit_id"]: record for record in manifest["records"]}
+    create_tensor, created_tensors = payload_tensor_factory(records, payload)
+    batch_calls = 0
+
+    def create_tensors(_tensor_specs):
+        nonlocal batch_calls
+        batch_calls += 1
+        return None
+
+    provider = EagerSelectedExpertsGlmTensorProvider(
+        adapter=adapter,
+        tensor_factory=create_tensor,
+        batched_tensor_factory=create_tensors,
+    )
+    demands = [
+        SimpleNamespace(unit_id=unit_id)
+        for expert_id in (1, 2)
+        for unit_id in adapter.expert_unit_ids(expert_id, layer_id=3)
+    ]
+
+    with provider.request_experts(demands) as resident_experts:
+        assert set(resident_experts.experts) == {1, 2}
+        inside_stats = provider.stats()
+        assert inside_stats["active_leases"] == 2
+
+    stats = provider.stats()
+    assert batch_calls == 1
+    assert len(created_tensors) == 12
+    assert stats["loads"] == 12
+    assert stats["materialization_batches"] == 0
+    assert stats["materialization_fallback_loads"] == 12
+    assert stats["active_leases"] == 0
+
+
+def test_eager_selected_experts_batched_factory_failure_is_atomic():
+    manifest = tiny_glm_manifest(layer_ids=(3,))
+    payload = manifest_payload(manifest)
+    adapter = Glm53Adapter(manifest)
+    records = {record["unit_id"]: record for record in manifest["records"]}
+    create_tensor, _created_tensors = payload_tensor_factory(records, payload)
+    valid_tensors = [
+        create_tensor(unit_id)
+        for expert_id in (1, 2)
+        for unit_id in adapter.expert_unit_ids(expert_id, layer_id=3)
+    ]
+    demands = [
+        SimpleNamespace(unit_id=unit_id)
+        for expert_id in (1, 2)
+        for unit_id in adapter.expert_unit_ids(expert_id, layer_id=3)
+    ]
+    invalid_returns = (
+        valid_tensors[:-1],
+        [tensor.to(torch.float32) for tensor in valid_tensors],
+        [valid_tensors[0].reshape(1, -1), *valid_tensors[1:]],
+    )
+    expected_errors = (
+        ValueError,
+        TypeError,
+        ValueError,
+    )
+
+    for returned_tensors, expected_error in zip(
+        invalid_returns,
+        expected_errors,
+        strict=True,
+    ):
+        batch_calls = 0
+
+        def create_tensors(_tensor_specs, returned_tensors=returned_tensors):
+            nonlocal batch_calls
+            batch_calls += 1
+            return returned_tensors
+
+        provider = EagerSelectedExpertsGlmTensorProvider(
+            adapter=adapter,
+            tensor_factory=create_tensor,
+            batched_tensor_factory=create_tensors,
+        )
+        with pytest.raises(expected_error, match="Tiered GLM"):
+            provider.request_experts(demands)
+        stats = provider.stats()
+        assert batch_calls == 1
+        assert stats["requests"] == 0
+        assert stats["loads"] == 0
+        assert stats["storage_read_bytes"] == 0
+        assert stats["materialization_batches"] == 0
+        assert stats["materialization_fallback_loads"] == 0
+        assert stats["active_leases"] == 0
+        assert stats["resident_bytes"] == 0
+
+
+def test_eager_route_replay_prefetch_overlaps_and_preserves_exact_output():
+    manifest = tiny_glm_manifest(layer_ids=(3, 4))
+    payload = manifest_payload(manifest)
+    adapter = Glm53Adapter(manifest)
+    records = {record["unit_id"]: record for record in manifest["records"]}
+    create_tensor, _created_tensors = payload_tensor_factory(records, payload)
+    next_layer_materialization_started = threading.Event()
+    release_next_layer_materialization = threading.Event()
+
+    def controlled_create_tensor(unit_id: str) -> torch.Tensor:
+        if unit_id.startswith("model.layers.4."):
+            next_layer_materialization_started.set()
+            assert release_next_layer_materialization.wait(timeout=5)
+        return create_tensor(unit_id)
+
+    provider = EagerSelectedExpertsGlmTensorProvider(
+        adapter=adapter,
+        tensor_factory=controlled_create_tensor,
+        enable_route_replay_next_layer_prefetch=True,
+    )
+    provider.route_controller = TieredGlmRouteController.replay(
+        torch.tensor([[[1, 2], [3, 4]]], dtype=torch.int32),
+        torch.tensor([[[0.25, 0.75], [0.75, 0.25]]], dtype=torch.float32),
+        row_count=1,
+        layer_count=2,
+        top_k=2,
+        device="cpu",
+    )
+    method = TieredGlm53MoEMethod(SimpleNamespace(), provider=provider)
+    hidden_states = torch.tensor([[1.0, -2.0, 3.0]], dtype=torch.bfloat16)
+    expected_layer_3 = all_resident_reference(
+        hidden_states,
+        torch.tensor([[0.25, 0.75]], dtype=torch.float32),
+        torch.tensor([[1, 2]], dtype=torch.int32),
+        all_resident_experts(adapter, records, payload, (1, 2), layer_id=3),
+    )
+    expected_layer_4 = all_resident_reference(
+        hidden_states,
+        torch.tensor([[0.75, 0.25]], dtype=torch.float32),
+        torch.tensor([[3, 4]], dtype=torch.int32),
+        all_resident_experts(adapter, records, payload, (3, 4), layer_id=4),
+    )
+
+    layer_3_result = method.apply(
+        layer=FakeRoutedExpertsLayer(),
+        x=hidden_states,
+        topk_weights=torch.ones((1, 2), dtype=torch.float32),
+        topk_ids=torch.tensor([[9, 8]], dtype=torch.int32),
+        shared_experts=None,
+        shared_experts_input=None,
+    )
+    assert next_layer_materialization_started.is_set()
+    assert torch.allclose(layer_3_result, expected_layer_3, rtol=0.0, atol=0.0)
+    during_callback_stats = provider.stats()
+    assert during_callback_stats["route_replay_next_layer_prefetch_active"]
+    assert during_callback_stats["route_replay_next_layer_prefetch_bytes"] > 0
+    assert during_callback_stats["active_leases"] == 0
+
+    release_next_layer_materialization.set()
+    layer_4_result = method.apply(
+        layer=SimpleNamespace(layer_name="model.layers.4.mlp.experts"),
+        x=hidden_states,
+        topk_weights=torch.ones((1, 2), dtype=torch.float32),
+        topk_ids=torch.tensor([[9, 8]], dtype=torch.int32),
+        shared_experts=None,
+        shared_experts_input=None,
+    )
+    assert torch.allclose(layer_4_result, expected_layer_4, rtol=0.0, atol=0.0)
+    stats = provider.stats()
+    assert stats["requests"] == 2
+    assert stats["route_replay_next_layer_prefetch_requests"] == 1
+    assert stats["route_replay_next_layer_prefetch_hits"] == 1
+    assert stats["route_replay_next_layer_prefetch_failures"] == 0
+    assert stats["route_replay_next_layer_prefetch_fallbacks"] == 0
+    assert not stats["route_replay_next_layer_prefetch_active"]
+    assert stats["route_replay_next_layer_prefetch_bytes"] == 0
+    assert stats["active_leases"] == 0
+    assert stats["resident_bytes"] == 0
+
+
+def test_eager_route_replay_prefetch_missing_next_layer_fails_closed():
+    manifest = tiny_glm_manifest(layer_ids=(3, 4))
+    payload = manifest_payload(manifest)
+    adapter = Glm53Adapter(manifest)
+    records = {record["unit_id"]: record for record in manifest["records"]}
+    create_tensor, created_tensors = payload_tensor_factory(records, payload)
+    provider = EagerSelectedExpertsGlmTensorProvider(
+        adapter=adapter,
+        tensor_factory=create_tensor,
+        enable_route_replay_next_layer_prefetch=True,
+    )
+    provider.route_controller = TieredGlmRouteController.replay(
+        torch.tensor([[[1, 2], [3, 4]]], dtype=torch.int32),
+        torch.ones((1, 2, 2), dtype=torch.float32),
+        row_count=1,
+        layer_count=2,
+        top_k=2,
+        device="cpu",
+    )
+    demands = [
+        SimpleNamespace(unit_id=unit_id)
+        for expert_id in (3, 4)
+        for unit_id in adapter.expert_unit_ids(expert_id, layer_id=4)
+    ]
+
+    with pytest.raises(RuntimeError, match="prefetch was missing for layer 4"):
+        provider.request_experts(demands)
+
+    assert not any(
+        unit_id.startswith("model.layers.4.") for unit_id in created_tensors
+    )
+    stats = provider.stats()
+    assert stats["route_replay_next_layer_prefetch_fallbacks"] == 1
+    assert stats["route_replay_next_layer_prefetch_hits"] == 0
+    assert stats["active_leases"] == 0
+
+
 def device_runtime_for_tiny_glm(
     layer_ids: tuple[int, ...] = (3,),
     *,
@@ -321,11 +603,13 @@ def device_runtime_for_tiny_glm(
     device_budget_bytes: int = 600,
     expert_cache_budget_bytes: int | None = None,
     prefetch_depth: int = 1,
+    manifest: dict[str, object] | None = None,
 ):
-    manifest = tiny_glm_manifest(
-        layer_ids=layer_ids,
-        expert_count=expert_count,
-    )
+    if manifest is None:
+        manifest = tiny_glm_manifest(
+            layer_ids=layer_ids,
+            expert_count=expert_count,
+        )
     payload = manifest_payload(manifest)
     for record in manifest["records"]:
         record["checksum_sha256"] = hashlib.sha256(
@@ -547,6 +831,9 @@ class RecordingDeviceRuntime:
     def stats(self):
         return self._runtime.stats()
 
+    def drain_prefetches(self):
+        return self._runtime.drain_prefetches()
+
 
 def test_vllm_glm_path_routes_and_materializes_layers_3_and_77():
     adapter, runtime, manifest, records, payload, store = device_runtime_for_tiny_glm(
@@ -594,7 +881,10 @@ def test_vllm_glm_path_routes_and_materializes_layers_3_and_77():
         )
 
         assert torch.allclose(result, expected, rtol=0.0, atol=0.0)
-        assert recording_runtime.acquire_experts_calls == [((1, 7, 9), layer_id)]
+        assert recording_runtime.acquire_experts_calls == [
+            ((1, 7), layer_id),
+            ((7, 9), layer_id),
+        ]
 
         expected_unit_ids = set()
         for expert_id in (1, 7, 9):
@@ -615,6 +905,74 @@ def test_vllm_glm_path_routes_and_materializes_layers_3_and_77():
         assert read_unit_ids == expected_unit_ids
 
     assert layer_unit_ids[3].isdisjoint(layer_unit_ids[77])
+
+
+def test_vllm_glm_mtp_layer_routes_tiered_experts_and_preserves_output():
+    manifest = tiny_glm_mtp_manifest()
+    adapter, runtime, manifest, records, payload, store = device_runtime_for_tiny_glm(
+        manifest=manifest
+    )
+    recording_runtime = RecordingDeviceRuntime(runtime)
+    provider = DeviceWeightRuntimeGlmTensorProvider(
+        runtime=recording_runtime,
+        adapter=adapter,
+    )
+    method = TieredGlm53MoEMethod(
+        SimpleNamespace(),
+        provider=provider,
+        adapter=adapter,
+    )
+    generator = torch.Generator().manual_seed(1234)
+    hidden_states = torch.randn((2, 3), generator=generator, dtype=torch.bfloat16)
+    topk_weights = torch.tensor(
+        [[0.25, 0.75], [0.125, 0.875]],
+        dtype=torch.float32,
+    )
+    topk_ids = torch.tensor([[1, 7], [7, 9]], dtype=torch.int32)
+    expected = all_resident_reference(
+        hidden_states,
+        topk_weights,
+        topk_ids,
+        all_resident_experts(
+            adapter,
+            records,
+            payload,
+            tuple(range(10)),
+            layer_id=78,
+        ),
+    )
+
+    result = method.apply(
+        layer=SimpleNamespace(layer_name="model.layers.78.mlp.experts"),
+        x=hidden_states,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        shared_experts=None,
+        shared_experts_input=None,
+    )
+
+    assert torch.equal(result, expected)
+    assert recording_runtime.acquire_experts_calls == [
+        ((1, 7), 78),
+        ((7, 9), 78),
+    ]
+    expected_unit_ids = set()
+    for expert_id in (1, 7, 9):
+        expected_unit_ids.update(adapter.expert_unit_ids(expert_id, layer_id=78))
+    read_unit_ids = {
+        unit_id
+        for unit_id, record in records.items()
+        if (
+            manifest["storage_key"],
+            record["offset_bytes"],
+            record["length_bytes"],
+        )
+        in store.reads
+    }
+    assert read_unit_ids == expected_unit_ids
+    runtime_stats = runtime.stats()
+    assert runtime_stats["active_leases"] == 0
+    assert runtime_stats["staging_bytes"] == 0
 
 
 def test_vllm_glm_path_partitions_multi_token_expert_unions():
@@ -673,6 +1031,13 @@ def test_partition_rows_by_expert_union_defaults_to_routing_width():
     assert _partition_rows_by_expert_union(topk_ids, 2, max_expert_union=4) == [
         [0, 1, 2]
     ]
+
+
+def test_provider_max_expert_union_uses_routing_width_not_resident_capacity():
+    provider = SimpleNamespace(stats=lambda: {"max_resident_experts": 1234})
+    method = TieredGlm53MoEMethod(SimpleNamespace(), provider=provider)
+
+    assert method._provider_max_expert_union(8) == 8
 
 
 def test_glm_execution_scratch_matches_parent_n32_dequant_peak():
@@ -739,7 +1104,7 @@ def test_glm_execution_scratch_accounts_for_vectorized_row_independent_gemm():
         )
 
 
-def test_vllm_glm_path_batches_mixed_rows_up_to_provider_max_union():
+def test_vllm_glm_path_batches_rows_by_routing_width_expert_union():
     adapter, runtime, manifest, records, payload, _ = device_runtime_for_tiny_glm(
         expert_count=18,
         max_resident_experts=12,
@@ -759,7 +1124,7 @@ def test_vllm_glm_path_batches_mixed_rows_up_to_provider_max_union():
     hidden_states = torch.randn((3, 3), generator=generator, dtype=torch.bfloat16)
     topk_weights = torch.full((3, 8), 0.125, dtype=torch.float32)
     topk_ids = torch.tensor(
-        [list(range(8)), list(range(4, 12)), list(range(10, 18))],
+        [list(range(8)), list(range(8)), list(range(8, 16))],
         dtype=torch.int32,
     )
     expected = all_resident_reference(
@@ -770,7 +1135,7 @@ def test_vllm_glm_path_batches_mixed_rows_up_to_provider_max_union():
             adapter,
             records,
             payload,
-            tuple(range(18)),
+            tuple(range(16)),
         ),
     )
 
@@ -784,7 +1149,7 @@ def test_vllm_glm_path_batches_mixed_rows_up_to_provider_max_union():
     )
 
     assert torch.equal(result, expected)
-    assert provider.acquired_expert_counts == [12, 8]
+    assert provider.acquired_expert_counts == [8, 8]
     assert all(lease_set.released for lease_set in runtime.lease_sets)
     runtime_stats = runtime.stats()
     assert runtime_stats["active_leases"] == 0
@@ -871,7 +1236,7 @@ def test_vllm_glm_path_consumes_chunk_output_before_release():
     hidden_states = torch.randn((2, 3), generator=generator, dtype=torch.bfloat16)
     topk_weights = torch.full((2, 8), 0.125, dtype=torch.float32)
     topk_ids = torch.tensor(
-        [list(range(8)), list(range(4, 12))],
+        [list(range(8)), list(range(8))],
         dtype=torch.int32,
     )
     expected = all_resident_reference(
@@ -928,7 +1293,7 @@ def test_vllm_glm_path_reserves_execution_scratch_in_device_budget():
             x=torch.zeros((2, 3), dtype=torch.bfloat16),
             topk_weights=torch.ones((2, 8), dtype=torch.float32),
             topk_ids=torch.tensor(
-                [list(range(8)), list(range(4, 12))],
+                [list(range(8)), list(range(8))],
                 dtype=torch.int32,
             ),
             shared_experts=None,
@@ -938,6 +1303,26 @@ def test_vllm_glm_path_reserves_execution_scratch_in_device_budget():
     runtime_stats = runtime.stats()
     assert runtime_stats["active_leases"] == 0
     assert runtime_stats["scratch_bytes"] == 0
+
+
+def test_vllm_glm_provider_forwards_sequence_turn_boundaries():
+    calls: list[bool] = []
+    runtime = SimpleNamespace(begin_sequence_turn=lambda: calls.append(True))
+    provider = DeviceWeightRuntimeGlmTensorProvider(
+        runtime=runtime,
+        adapter=SimpleNamespace(),
+    )
+
+    provider.begin_sequence_turn()
+
+    assert calls == [True]
+
+    unsupported = DeviceWeightRuntimeGlmTensorProvider(
+        runtime=SimpleNamespace(),
+        adapter=SimpleNamespace(),
+    )
+    with pytest.raises(ValueError, match="does not support sequence turns"):
+        unsupported.begin_sequence_turn()
 
 
 def test_vllm_glm_path_uses_device_runtime_and_selected_experts_only():
@@ -3326,6 +3711,7 @@ def test_vllm_glm_current_router_predictor_fires_on_every_sparse_layer():
                 )
             )
             assert torch.allclose(outputs[-1], expected, rtol=0.0, atol=0.0)
+            provider.drain_prefetches()
 
         assert recording_runtime.prefetch_calls == []
         assert recording_runtime.submit_calls == [
@@ -3820,6 +4206,53 @@ def test_deepseek_glm_path_selects_lazy_routed_experts(monkeypatch: pytest.Monke
             "provider": provider,
             "adapter": adapter,
         }
+    finally:
+        clear_glm_53_tiered_experts()
+
+
+def test_glm_mtp_model_type_dispatches_to_tiered_glm_factory():
+    clear_glm_53_tiered_experts()
+    provider = SimpleNamespace()
+    mtp_config = SimpleNamespace(
+        model_type="deepseek_mtp",
+        n_routed_experts=256,
+        num_experts_per_tok=8,
+        hidden_size=6144,
+        moe_intermediate_size=2048,
+    )
+    normal_deepseek_mtp_config = SimpleNamespace(
+        model_type="deepseek_mtp",
+        n_routed_experts=64,
+        num_experts_per_tok=6,
+        hidden_size=2048,
+        moe_intermediate_size=1408,
+    )
+    glm_base_config = SimpleNamespace(
+        model_type="glm_moe_dsa",
+        n_routed_experts=256,
+        num_experts_per_tok=8,
+        hidden_size=6144,
+        moe_intermediate_size=2048,
+    )
+
+    configure_glm_53_tiered_experts(provider)
+    try:
+        assert glm_53_tiered_experts(
+            mtp_config,
+            "model.layers.78.mlp",
+        ) == (TieredGlm53RoutedExperts, {"provider": provider})
+        assert glm_53_tiered_experts(
+            mtp_config,
+            "model.layers.3.mlp",
+        ) is None
+        assert glm_53_tiered_experts(
+            normal_deepseek_mtp_config,
+            "model.layers.27.mlp",
+        ) is None
+        assert glm_53_tiered_experts(
+            glm_base_config,
+            "model.layers.78.mlp",
+        ) is None
     finally:
         clear_glm_53_tiered_experts()
 
