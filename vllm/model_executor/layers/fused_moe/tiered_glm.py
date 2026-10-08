@@ -274,6 +274,7 @@ class _TieredGlm53Config:
 
 
 _GlmDeviceCacheKey = tuple[int, int, str]
+_GlmDeviceCacheGroupKey = tuple[int, int]
 _GlmDequantCacheKey = tuple[str, str]
 
 
@@ -1482,6 +1483,14 @@ class EagerSelectedExpertsGlmTensorProvider:
 class DeviceWeightRuntimeGlmTensorProvider:
     """Adapt the model-agnostic runtime to the GLM routed-expert API."""
 
+    _DEVICE_CACHE_POLICIES = frozenset(("lru", "causal-turn-frequency-slru"))
+    _STABLE_WINDOW = 3
+    _STABLE_MIN_PRIOR_DEMAND = 1
+    _PROTECTED_FRACTION = 0.44
+    _TURN_FREQUENCY_THRESHOLD = 3
+    _TURN_FREQUENCY_WEIGHT = 2.0
+    _STABLE_PRIORITY_BONUS = 8.0
+
     def __init__(
         self,
         *,
@@ -1497,6 +1506,9 @@ class DeviceWeightRuntimeGlmTensorProvider:
         | None = None,
         prefetch_depth: int = 1,
         device_cache_budget_bytes: int | None = None,
+        device_cache_policy: str = "lru",
+        layer_quota_groups: int | None = None,
+        layer_quota_bytes: int | None = None,
         dequant_cache_budget_bytes: int | None = None,
         apply_timings: TieredGlmApplyTimings | None = None,
     ) -> None:
@@ -1508,6 +1520,28 @@ class DeviceWeightRuntimeGlmTensorProvider:
             raise ValueError(
                 "device_cache_budget_bytes must be a non-negative integer or None"
             )
+        if device_cache_policy not in self._DEVICE_CACHE_POLICIES:
+            raise ValueError(
+                "device_cache_policy must be 'lru' or 'causal-turn-frequency-slru'"
+            )
+        if layer_quota_groups is not None and (
+            type(layer_quota_groups) is not int or layer_quota_groups <= 0
+        ):
+            raise ValueError("layer_quota_groups must be a positive integer or None")
+        if layer_quota_bytes is not None and (
+            type(layer_quota_bytes) is not int or layer_quota_bytes <= 0
+        ):
+            raise ValueError("layer_quota_bytes must be a positive integer or None")
+        if (layer_quota_groups is None) != (layer_quota_bytes is None):
+            raise ValueError("layer byte and group quotas must be provided together")
+        if device_cache_policy == "causal-turn-frequency-slru" and (
+            layer_quota_groups is None or layer_quota_bytes is None
+        ):
+            raise ValueError(
+                "causal-turn-frequency-slru requires layer byte and group quotas"
+            )
+        if device_cache_policy == "lru" and layer_quota_groups is not None:
+            raise ValueError("layer quotas require causal-turn-frequency-slru")
         if dequant_cache_budget_bytes is not None and (
             type(dequant_cache_budget_bytes) is not int
             or dequant_cache_budget_bytes < 0
@@ -1537,11 +1571,22 @@ class DeviceWeightRuntimeGlmTensorProvider:
         self._active_prefetches: dict[int, Any] = {}
         self._active_prefetch_layer_ids: dict[int, int] = {}
         self._device_cache_budget_bytes = device_cache_budget_bytes
+        self._device_cache_policy = device_cache_policy
+        self._layer_quota_groups = layer_quota_groups
+        self._layer_quota_bytes = layer_quota_bytes
         self.apply_timings = apply_timings
         self._device_cache: OrderedDict[
             _GlmDeviceCacheKey,
             _GlmDeviceCacheEntry,
         ] = OrderedDict()
+        self._device_cache_groups: OrderedDict[
+            _GlmDeviceCacheGroupKey,
+            set[_GlmDeviceCacheKey],
+        ] = OrderedDict()
+        self._device_cache_group_sizes: dict[_GlmDeviceCacheGroupKey, int] = {}
+        self._device_cache_group_bytes: dict[_GlmDeviceCacheGroupKey, int] = {}
+        self._device_cache_layer_bytes: dict[int, int] = {}
+        self._device_cache_layer_group_counts: dict[int, int] = {}
         self._device_cache_lock = threading.RLock()
         self._device_cache_bytes = 0
         self._device_cache_peak_bytes = 0
@@ -1549,6 +1594,23 @@ class DeviceWeightRuntimeGlmTensorProvider:
         self._device_cache_misses = 0
         self._device_cache_evictions = 0
         self._device_cache_active_leases = 0
+        self._current_turn_groups: set[_GlmDeviceCacheGroupKey] = set()
+        self._current_turn_demand_counts: dict[_GlmDeviceCacheGroupKey, int] = {}
+        self._previous_turn_groups: deque[set[_GlmDeviceCacheGroupKey]] = deque(
+            maxlen=self._STABLE_WINDOW
+        )
+        self._previous_turn_demand_counts: deque[dict[_GlmDeviceCacheGroupKey, int]] = (
+            deque(maxlen=self._STABLE_WINDOW)
+        )
+        self._stable_pinned_groups: set[_GlmDeviceCacheGroupKey] = set()
+        self._causal_pinned_groups: set[_GlmDeviceCacheGroupKey] = set()
+        self._protected_groups: set[_GlmDeviceCacheGroupKey] = set()
+        self._protected_group_target = (
+            max(1, int(layer_quota_groups * self._PROTECTED_FRACTION))
+            if layer_quota_groups is not None
+            else 0
+        )
+        self._sequence_turn_index = 0
         self._dequant_cache_budget_bytes = dequant_cache_budget_bytes
         self._dequant_cache = DerivedTensorCache(
             dequant_cache_budget_bytes,
@@ -1579,6 +1641,8 @@ class DeviceWeightRuntimeGlmTensorProvider:
             selected_experts,
             requested_units,
         )
+        for group_key in sorted(selected_experts):
+            self._record_device_cache_policy_access(group_key)
 
         uncached_expert_ids: list[int] = []
         cached_experts: dict[
@@ -1730,6 +1794,25 @@ class DeviceWeightRuntimeGlmTensorProvider:
         if not callable(begin_sequence_turn):
             raise ValueError("Tiered GLM runtime does not support sequence turns")
         begin_sequence_turn()
+        if self._device_cache_policy != "causal-turn-frequency-slru":
+            return
+
+        with self._device_cache_lock:
+            if self._current_turn_groups:
+                self._previous_turn_groups.append(set(self._current_turn_groups))
+                self._previous_turn_demand_counts.append(
+                    dict(self._current_turn_demand_counts)
+                )
+                self._sequence_turn_index += 1
+            self._current_turn_groups.clear()
+            self._current_turn_demand_counts.clear()
+            self._stable_pinned_groups = self._select_stable_groups_locked()
+            self._causal_pinned_groups = set(self._stable_pinned_groups)
+            self._protected_groups = {
+                group_key
+                for group_key in self._stable_pinned_groups
+                if group_key in self._device_cache_groups
+            }
 
     def prefetch_next_layer_experts(
         self,
@@ -1977,6 +2060,12 @@ class DeviceWeightRuntimeGlmTensorProvider:
             stats["device_cache_peak_bytes"] = self._device_cache_peak_bytes
             stats["device_cache_budget_bytes"] = self._device_cache_budget_bytes
             stats["device_cache_active_leases"] = self._device_cache_active_leases
+            stats["device_cache_policy"] = self._device_cache_policy
+            stats["device_cache_layer_quota_groups"] = self._layer_quota_groups
+            stats["device_cache_layer_quota_bytes"] = self._layer_quota_bytes
+            stats["device_cache_pinned_groups"] = len(self._causal_pinned_groups)
+            stats["device_cache_protected_groups"] = len(self._protected_groups)
+            stats["device_cache_sequence_turns"] = self._sequence_turn_index
         stats.update(self._dequant_cache.stats())
         return stats
 
@@ -2000,6 +2089,212 @@ class DeviceWeightRuntimeGlmTensorProvider:
             )
         return projection_names
 
+    def _record_device_cache_policy_access(
+        self,
+        group_key: _GlmDeviceCacheGroupKey,
+    ) -> None:
+        if self._device_cache_policy != "causal-turn-frequency-slru":
+            return
+
+        with self._device_cache_lock:
+            self._current_turn_groups.add(group_key)
+            demand_count = self._current_turn_demand_counts.get(group_key, 0) + 1
+            self._current_turn_demand_counts[group_key] = demand_count
+            if demand_count < self._TURN_FREQUENCY_THRESHOLD:
+                return
+
+            self._causal_pinned_groups = self._select_causal_groups_locked()
+            self._protected_groups.update(
+                group_key
+                for group_key in self._causal_pinned_groups
+                if group_key in self._device_cache_groups
+            )
+
+    def _select_stable_groups_locked(
+        self,
+    ) -> set[_GlmDeviceCacheGroupKey]:
+        if len(self._previous_turn_groups) < self._STABLE_WINDOW:
+            return set()
+
+        stable_groups = set(self._previous_turn_groups[-1])
+        for previous_groups in self._previous_turn_groups:
+            stable_groups &= previous_groups
+
+        prior_counts: dict[_GlmDeviceCacheGroupKey, int] = {}
+        for turn_counts in self._previous_turn_demand_counts:
+            for group_key, demand_count in turn_counts.items():
+                prior_counts[group_key] = prior_counts.get(group_key, 0) + demand_count
+
+        stable_groups = {
+            group_key
+            for group_key in stable_groups
+            if prior_counts.get(group_key, 0) >= self._STABLE_MIN_PRIOR_DEMAND
+        }
+        return self._select_quoted_groups_locked(
+            stable_groups,
+            lambda group_key: (-prior_counts.get(group_key, 0), group_key),
+        )
+
+    def _select_causal_groups_locked(
+        self,
+    ) -> set[_GlmDeviceCacheGroupKey]:
+        scores: dict[_GlmDeviceCacheGroupKey, float] = {}
+        for group_key in self._stable_pinned_groups:
+            scores[group_key] = self._STABLE_PRIORITY_BONUS
+        for group_key, demand_count in self._current_turn_demand_counts.items():
+            if demand_count >= self._TURN_FREQUENCY_THRESHOLD:
+                scores[group_key] = (
+                    scores.get(group_key, 0.0)
+                    + self._TURN_FREQUENCY_WEIGHT * demand_count
+                )
+
+        return self._select_quoted_groups_locked(
+            set(scores),
+            lambda group_key: (-scores[group_key], group_key),
+        )
+
+    def _select_quoted_groups_locked(
+        self,
+        groups: set[_GlmDeviceCacheGroupKey],
+        sort_key: Callable[[_GlmDeviceCacheGroupKey], tuple[float, ...]],
+    ) -> set[_GlmDeviceCacheGroupKey]:
+        selected_groups: set[_GlmDeviceCacheGroupKey] = set()
+        selected_layer_bytes: dict[int, int] = {}
+        selected_layer_groups: dict[int, int] = {}
+        for group_key in sorted(groups, key=sort_key):
+            layer_id = group_key[0]
+            group_bytes = self._device_cache_group_size_locked(group_key)
+            if (
+                selected_layer_bytes.get(layer_id, 0) + group_bytes
+                > self._layer_quota_bytes
+                or selected_layer_groups.get(layer_id, 0) + 1 > self._layer_quota_groups
+            ):
+                continue
+            selected_groups.add(group_key)
+            selected_layer_bytes[layer_id] = (
+                selected_layer_bytes.get(layer_id, 0) + group_bytes
+            )
+            selected_layer_groups[layer_id] = selected_layer_groups.get(layer_id, 0) + 1
+        return selected_groups
+
+    def _device_cache_group_size_locked(
+        self,
+        group_key: _GlmDeviceCacheGroupKey,
+    ) -> int:
+        cached_size = self._device_cache_group_sizes.get(group_key)
+        if cached_size is not None:
+            return cached_size
+
+        layer_id, expert_id = group_key
+        group_bytes = 0
+        for unit_id in self._adapter.expert_unit_ids(
+            expert_id,
+            layer_id=layer_id,
+        ):
+            metadata = self._adapter.native_metadata(unit_id)
+            unit_bytes = metadata.get("length_bytes")
+            if type(unit_bytes) is not int or unit_bytes < 0:
+                raise ValueError(
+                    f"invalid native byte count for Tiered GLM unit {unit_id!r}"
+                )
+            group_bytes += unit_bytes
+
+        self._device_cache_group_sizes[group_key] = group_bytes
+        return group_bytes
+
+    def _group_has_active_lease_locked(
+        self,
+        group_key: _GlmDeviceCacheGroupKey,
+    ) -> bool:
+        return any(
+            self._device_cache[cache_key].active_leases != 0
+            for cache_key in self._device_cache_groups[group_key]
+        )
+
+    def _select_group_victim_locked(
+        self,
+        candidates: Iterable[_GlmDeviceCacheGroupKey],
+    ) -> _GlmDeviceCacheGroupKey | None:
+        group_candidates = [
+            group_key
+            for group_key in candidates
+            if not self._group_has_active_lease_locked(group_key)
+        ]
+        if not group_candidates:
+            return None
+
+        nonpinned_candidates = [
+            group_key
+            for group_key in group_candidates
+            if group_key not in self._causal_pinned_groups
+        ]
+        probation_candidates = [
+            group_key
+            for group_key in nonpinned_candidates
+            if group_key not in self._protected_groups
+        ]
+        return (probation_candidates or nonpinned_candidates or group_candidates)[0]
+
+    def _prepare_device_cache_group_locked(
+        self,
+        group_key: _GlmDeviceCacheGroupKey,
+    ) -> bool:
+        full_group_bytes = self._device_cache_group_size_locked(group_key)
+        if full_group_bytes > self._device_cache_budget_bytes:
+            return False
+
+        layer_id = group_key[0]
+        while True:
+            current_group_bytes = self._device_cache_group_bytes.get(group_key, 0)
+            projected_bytes = (
+                self._device_cache_bytes - current_group_bytes + full_group_bytes
+            )
+            projected_layer_bytes = (
+                self._device_cache_layer_bytes.get(layer_id, 0)
+                - current_group_bytes
+                + full_group_bytes
+            )
+            projected_layer_groups = self._device_cache_layer_group_counts.get(
+                layer_id,
+                0,
+            ) + (0 if group_key in self._device_cache_groups else 1)
+
+            exceeds_layer_quota = (
+                projected_layer_bytes > self._layer_quota_bytes
+                or projected_layer_groups > self._layer_quota_groups
+            )
+            exceeds_global_budget = projected_bytes > self._device_cache_budget_bytes
+            if not exceeds_layer_quota and not exceeds_global_budget:
+                return True
+
+            victim_group = None
+            if exceeds_layer_quota:
+                victim_group = self._select_group_victim_locked(
+                    current_group_key
+                    for current_group_key in self._device_cache_groups
+                    if current_group_key[0] == layer_id
+                    and current_group_key != group_key
+                )
+            if victim_group is None and not exceeds_global_budget:
+                return True
+            if victim_group is None:
+                victim_group = self._select_group_victim_locked(
+                    current_group_key
+                    for current_group_key in self._device_cache_groups
+                    if current_group_key != group_key
+                )
+                if victim_group is None:
+                    return False
+
+            self._remove_cached_group_locked(victim_group)
+
+    def _remove_cached_group_locked(
+        self,
+        group_key: _GlmDeviceCacheGroupKey,
+    ) -> None:
+        for cache_key in tuple(self._device_cache_groups[group_key]):
+            self._remove_cached_projection(cache_key)
+
     def _acquire_cached_projection(
         self,
         cache_key: _GlmDeviceCacheKey,
@@ -2016,7 +2311,16 @@ class DeviceWeightRuntimeGlmTensorProvider:
             entry.active_leases += 1
             self._device_cache_active_leases += 1
             self._device_cache.move_to_end(cache_key)
+            group_key = cache_key[:2]
+            self._device_cache_groups.move_to_end(group_key)
             self._device_cache_hits += 1
+            if (
+                self._device_cache_policy == "causal-turn-frequency-slru"
+                and group_key not in self._causal_pinned_groups
+                and group_key not in self._protected_groups
+                and len(self._protected_groups) < self._protected_group_target
+            ):
+                self._protected_groups.add(group_key)
             return entry.projection
 
     def _cache_projection(
@@ -2058,21 +2362,28 @@ class DeviceWeightRuntimeGlmTensorProvider:
                 scratch_reservation.close()
                 return None
 
-            budget_bytes = self._device_cache_budget_bytes
-            while self._device_cache_bytes + byte_count > budget_bytes:
-                evictable_key = next(
-                    (
-                        key
-                        for key, entry in self._device_cache.items()
-                        if entry.active_leases == 0
-                    ),
-                    None,
-                )
-                if evictable_key is None:
+            group_key = cache_key[:2]
+            if self._device_cache_policy == "causal-turn-frequency-slru":
+                if not self._prepare_device_cache_group_locked(group_key):
                     del cached_projection
                     scratch_reservation.close()
                     return None
-                self._remove_cached_projection(evictable_key)
+            else:
+                budget_bytes = self._device_cache_budget_bytes
+                while self._device_cache_bytes + byte_count > budget_bytes:
+                    evictable_key = next(
+                        (
+                            key
+                            for key, entry in self._device_cache.items()
+                            if entry.active_leases == 0
+                        ),
+                        None,
+                    )
+                    if evictable_key is None:
+                        del cached_projection
+                        scratch_reservation.close()
+                        return None
+                    self._remove_cached_projection(evictable_key)
 
             self._device_cache[cache_key] = _GlmDeviceCacheEntry(
                 projection=cached_projection,
@@ -2080,12 +2391,31 @@ class DeviceWeightRuntimeGlmTensorProvider:
                 active_leases=1,
                 scratch_reservation=scratch_reservation,
             )
+            group_keys = self._device_cache_groups.get(group_key)
+            if group_keys is None:
+                group_keys = set()
+                self._device_cache_groups[group_key] = group_keys
+                self._device_cache_layer_group_counts[group_key[0]] = (
+                    self._device_cache_layer_group_counts.get(group_key[0], 0) + 1
+                )
+                self._device_cache_group_bytes[group_key] = 0
+            group_keys.add(cache_key)
+            self._device_cache_groups.move_to_end(group_key)
+            self._device_cache_group_bytes[group_key] += byte_count
+            self._device_cache_layer_bytes[group_key[0]] = (
+                self._device_cache_layer_bytes.get(group_key[0], 0) + byte_count
+            )
             self._device_cache_bytes += byte_count
             self._device_cache_active_leases += 1
             self._device_cache_peak_bytes = max(
                 self._device_cache_peak_bytes,
                 self._device_cache_bytes,
             )
+            if (
+                self._device_cache_policy == "causal-turn-frequency-slru"
+                and group_key in self._causal_pinned_groups
+            ):
+                self._protected_groups.add(group_key)
         return cached_projection
 
     @staticmethod
@@ -2101,6 +2431,16 @@ class DeviceWeightRuntimeGlmTensorProvider:
             raise RuntimeError("attempted to evict an active Tiered GLM cache lease")
 
         self._device_cache_bytes -= entry.byte_count
+        group_key = cache_key[:2]
+        self._device_cache_group_bytes[group_key] -= entry.byte_count
+        self._device_cache_layer_bytes[group_key[0]] -= entry.byte_count
+        group_keys = self._device_cache_groups[group_key]
+        group_keys.remove(cache_key)
+        if not group_keys:
+            del self._device_cache_groups[group_key]
+            del self._device_cache_group_bytes[group_key]
+            self._device_cache_layer_group_counts[group_key[0]] -= 1
+            self._protected_groups.discard(group_key)
         self._device_cache_evictions += 1
         scratch_reservation = entry.scratch_reservation
         del entry

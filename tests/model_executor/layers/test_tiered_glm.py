@@ -2365,6 +2365,197 @@ def test_vllm_glm_device_cache_uses_lru_eviction():
     assert set(provider._device_cache) == expected_keys
 
 
+def test_vllm_glm_device_cache_policy_selection_and_validation():
+    adapter, runtime, _, _, _, _ = device_runtime_for_tiny_glm(
+        max_resident_experts=5,
+        slot_count=30,
+        device_budget_bytes=1000,
+    )
+    default_provider = DeviceWeightRuntimeGlmTensorProvider(
+        runtime=runtime,
+        adapter=adapter,
+        device_cache_budget_bytes=60,
+    )
+    default_stats = default_provider.stats()
+    assert default_stats["device_cache_policy"] == "lru"
+    assert default_stats["device_cache_layer_quota_groups"] is None
+    assert default_stats["device_cache_layer_quota_bytes"] is None
+
+    causal_provider = DeviceWeightRuntimeGlmTensorProvider(
+        runtime=runtime,
+        adapter=adapter,
+        device_cache_budget_bytes=60,
+        device_cache_policy="causal-turn-frequency-slru",
+        layer_quota_groups=2,
+        layer_quota_bytes=60,
+    )
+    causal_stats = causal_provider.stats()
+    assert causal_stats["device_cache_policy"] == "causal-turn-frequency-slru"
+    assert causal_stats["device_cache_layer_quota_groups"] == 2
+    assert causal_stats["device_cache_layer_quota_bytes"] == 60
+
+    with pytest.raises(ValueError, match="device_cache_policy"):
+        DeviceWeightRuntimeGlmTensorProvider(
+            runtime=runtime,
+            adapter=adapter,
+            device_cache_budget_bytes=60,
+            device_cache_policy="unknown",
+        )
+    with pytest.raises(ValueError, match="layer byte and group quotas"):
+        DeviceWeightRuntimeGlmTensorProvider(
+            runtime=runtime,
+            adapter=adapter,
+            device_cache_budget_bytes=60,
+            device_cache_policy="causal-turn-frequency-slru",
+            layer_quota_groups=2,
+        )
+    with pytest.raises(ValueError, match="requires layer byte and group quotas"):
+        DeviceWeightRuntimeGlmTensorProvider(
+            runtime=runtime,
+            adapter=adapter,
+            device_cache_budget_bytes=60,
+            device_cache_policy="causal-turn-frequency-slru",
+        )
+
+
+def test_vllm_glm_causal_policy_evicts_whole_expert_groups():
+    adapter, runtime, _, _, _, _ = device_runtime_for_tiny_glm(
+        max_resident_experts=5,
+        slot_count=30,
+        device_budget_bytes=1000,
+    )
+    provider = DeviceWeightRuntimeGlmTensorProvider(
+        runtime=runtime,
+        adapter=adapter,
+        device_cache_budget_bytes=60,
+        device_cache_policy="causal-turn-frequency-slru",
+        layer_quota_groups=1,
+        layer_quota_bytes=30,
+    )
+
+    for expert_id in (0, 1):
+        with provider.request_experts(glm_expert_demands(adapter, expert_id)):
+            pass
+
+    stats = provider.stats()
+    assert stats["device_cache_bytes"] == 30
+    assert stats["device_cache_evictions"] == 3
+    assert set(provider._device_cache_groups) == {(3, 1)}
+    expected_keys = {
+        (3, 1, projection_name)
+        for projection_name in ("gate_proj", "up_proj", "down_proj")
+    }
+    assert set(provider._device_cache) == expected_keys
+
+
+def test_vllm_glm_causal_policy_active_lease_blocks_group_eviction():
+    adapter, runtime, _, records, payload, _ = device_runtime_for_tiny_glm(
+        max_resident_experts=5,
+        slot_count=30,
+        device_budget_bytes=1000,
+    )
+    provider = DeviceWeightRuntimeGlmTensorProvider(
+        runtime=runtime,
+        adapter=adapter,
+        device_cache_budget_bytes=30,
+        device_cache_policy="causal-turn-frequency-slru",
+        layer_quota_groups=1,
+        layer_quota_bytes=30,
+    )
+    reference_experts = all_resident_experts(adapter, records, payload, (0, 1))
+
+    with provider.request_experts(glm_expert_demands(adapter, expert_id=0)) as first:
+        with provider.request_experts(
+            glm_expert_demands(adapter, expert_id=1)
+        ) as second:
+            inside_stats = provider.stats()
+            assert inside_stats["device_cache_bytes"] == 30
+            assert inside_stats["device_cache_evictions"] == 0
+            assert inside_stats["device_cache_active_leases"] == 3
+            assert inside_stats["active_leases"] == 1
+            for expert_id, resident_experts in ((0, first), (1, second)):
+                for projection in resident_experts.experts[expert_id].values():
+                    assert torch.equal(
+                        projection.weight.view(torch.uint8),
+                        reference_experts[expert_id][projection.weight_unit_id].view(
+                            torch.uint8
+                        ),
+                    )
+                    assert torch.equal(
+                        projection.scale.view(torch.uint8),
+                        reference_experts[expert_id][projection.scale_unit_id].view(
+                            torch.uint8
+                        ),
+                    )
+
+        assert set(provider._device_cache_groups) == {(3, 0)}
+
+    with provider.request_experts(glm_expert_demands(adapter, expert_id=1)):
+        pass
+
+    final_stats = provider.stats()
+    assert final_stats["device_cache_bytes"] == 30
+    assert final_stats["device_cache_evictions"] == 3
+    assert set(provider._device_cache_groups) == {(3, 1)}
+    assert final_stats["device_cache_active_leases"] == 0
+    assert final_stats["active_leases"] == 0
+
+
+def test_vllm_glm_causal_policy_preserves_exact_output():
+    adapter, runtime, _, records, payload, _ = device_runtime_for_tiny_glm(
+        max_resident_experts=5,
+        slot_count=30,
+        device_budget_bytes=1000,
+    )
+    provider = DeviceWeightRuntimeGlmTensorProvider(
+        runtime=runtime,
+        adapter=adapter,
+        device_cache_budget_bytes=30,
+        device_cache_policy="causal-turn-frequency-slru",
+        layer_quota_groups=1,
+        layer_quota_bytes=30,
+    )
+    method = TieredGlm53MoEMethod(SimpleNamespace(), provider=provider)
+    generator = torch.Generator().manual_seed(8642)
+    hidden_states = torch.randn((2, 3), generator=generator, dtype=torch.float32)
+    topk_weights = torch.ones((2, 1), dtype=torch.float32)
+    reference_experts = all_resident_experts(
+        adapter,
+        records,
+        payload,
+        tuple(range(10)),
+    )
+
+    for turn_index in range(4):
+        provider.begin_sequence_turn()
+        request_count = 4 if turn_index == 3 else 1
+        for request_index in range(request_count):
+            expert_id = 0 if turn_index < 3 or request_index < 3 else 1
+            topk_ids = torch.full((2, 1), expert_id, dtype=torch.int32)
+            expected = all_resident_reference(
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                reference_experts,
+            )
+            result = method.apply(
+                layer=FakeRoutedExpertsLayer(),
+                x=hidden_states,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                shared_experts=None,
+                shared_experts_input=None,
+            )
+            assert torch.allclose(result, expected, rtol=0.0, atol=0.0)
+
+    stats = provider.stats()
+    assert stats["device_cache_hits"] == 15
+    assert stats["device_cache_misses"] == 6
+    assert stats["device_cache_evictions"] == 3
+    assert stats["device_cache_pinned_groups"] == 1
+    assert stats["active_leases"] == 0
+
+
 def test_vllm_glm_device_cache_active_lease_prevents_eviction():
     adapter, runtime, _, records, payload, _ = device_runtime_for_tiny_glm(
         max_resident_experts=5,
