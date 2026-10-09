@@ -1626,6 +1626,43 @@ class DeviceWeightRuntimeGlmTensorProvider:
             or self._dequant_cache_budget_bytes is not None
         )
 
+    @contextmanager
+    def warmup_without_derived_caches(self):
+        """Run one warm-up without allocating derived-cache entries."""
+        with self._device_cache_lock:
+            if self._device_cache_active_leases != 0 or self._device_cache:
+                if self._device_cache_active_leases != 0:
+                    raise RuntimeError(
+                        "cannot start single-provider warm-up with an active "
+                        "device-cache lease"
+                    )
+                while self._device_cache:
+                    self._remove_cached_projection(next(iter(self._device_cache)))
+        dequant_stats = self._dequant_cache.stats()
+        if (
+            dequant_stats.get("dequant_cache_active_leases", 0) != 0
+            or dequant_stats.get("dequant_cache_bytes", 0) != 0
+        ):
+            if dequant_stats.get("dequant_cache_active_leases", 0) != 0:
+                raise RuntimeError(
+                    "cannot start single-provider warm-up with an active "
+                    "dequant-cache lease"
+                )
+            self._dequant_cache.evict_all()
+
+        device_cache_budget_bytes = self._device_cache_budget_bytes
+        dequant_cache_budget_bytes = self._dequant_cache_budget_bytes
+        dequant_cache_internal_budget_bytes = self._dequant_cache._budget_bytes
+        self._device_cache_budget_bytes = None
+        self._dequant_cache_budget_bytes = None
+        self._dequant_cache._budget_bytes = None
+        try:
+            yield
+        finally:
+            self._device_cache_budget_bytes = device_cache_budget_bytes
+            self._dequant_cache_budget_bytes = dequant_cache_budget_bytes
+            self._dequant_cache._budget_bytes = dequant_cache_internal_budget_bytes
+
     def request_experts(self, demands: Sequence[Any]) -> TieredGlmResidentExperts:
         if not demands:
             raise ValueError("Tiered GLM demands must not be empty")

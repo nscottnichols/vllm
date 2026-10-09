@@ -2325,6 +2325,102 @@ def test_glm_dequant_cache_close_releases_scratch_accounting():
     assert closed_stats["scratch_bytes"] == 0
 
 
+def test_glm_single_provider_warmup_disables_and_restores_derived_caches():
+    adapter, runtime, _, records, payload, store = device_runtime_for_tiny_glm(
+        max_resident_experts=3,
+        slot_count=18,
+        device_budget_bytes=1000,
+    )
+    runtime.close_calls = []
+    runtime.close = lambda: runtime.close_calls.append(True)
+    store.close_calls = []
+    store.close = lambda: store.close_calls.append(True)
+    provider = DeviceWeightRuntimeGlmTensorProvider(
+        runtime=runtime,
+        adapter=adapter,
+        device_cache_budget_bytes=60,
+        dequant_cache_budget_bytes=72,
+    )
+    method = TieredGlm53MoEMethod(SimpleNamespace(), provider=provider)
+    generator = torch.Generator().manual_seed(2468)
+    hidden_states = torch.randn((1, 3), generator=generator, dtype=torch.float32)
+    topk_weights = torch.tensor([[1.0]], dtype=torch.float32)
+    topk_ids = torch.tensor([[1]], dtype=torch.int32)
+    expected = all_resident_reference(
+        hidden_states,
+        topk_weights,
+        topk_ids,
+        all_resident_experts(adapter, records, payload, (1,)),
+    )
+
+    initialization_result = method.apply(
+        layer=FakeRoutedExpertsLayer(),
+        x=hidden_states,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        shared_experts=None,
+        shared_experts_input=None,
+    )
+    initialization_stats = provider.stats()
+    assert torch.equal(initialization_result, expected)
+    assert initialization_stats["device_cache_bytes"] > 0
+    assert initialization_stats["dequant_cache_bytes"] > 0
+
+    with (
+        pytest.raises(RuntimeError, match="warm-up failure"),
+        provider.warmup_without_derived_caches(),
+    ):
+        warmup_stats = provider.stats()
+        assert warmup_stats["device_cache_budget_bytes"] is None
+        assert warmup_stats["dequant_cache_budget_bytes"] is None
+        raise RuntimeError("warm-up failure")
+
+    restored_stats = provider.stats()
+    assert restored_stats["device_cache_budget_bytes"] == 60
+    assert restored_stats["dequant_cache_budget_bytes"] == 72
+
+    with provider.warmup_without_derived_caches():
+        warmup_stats = provider.stats()
+        assert warmup_stats["device_cache_budget_bytes"] is None
+        assert warmup_stats["dequant_cache_budget_bytes"] is None
+        warmup_result = method.apply(
+            layer=FakeRoutedExpertsLayer(),
+            x=hidden_states,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            shared_experts=None,
+            shared_experts_input=None,
+        )
+        assert torch.equal(warmup_result, expected)
+        warmup_stats = provider.stats()
+        assert warmup_stats["device_cache_bytes"] == 0
+        assert warmup_stats["dequant_cache_bytes"] == 0
+        assert runtime.close_calls == []
+        assert store.close_calls == []
+
+    restored_stats = provider.stats()
+    assert restored_stats["device_cache_budget_bytes"] == 60
+    assert restored_stats["dequant_cache_budget_bytes"] == 72
+
+    measured_result = method.apply(
+        layer=FakeRoutedExpertsLayer(),
+        x=hidden_states,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        shared_experts=None,
+        shared_experts_input=None,
+    )
+    measured_stats = provider.stats()
+    assert torch.equal(measured_result, expected)
+    assert measured_stats["device_cache_bytes"] == 30
+    assert measured_stats["dequant_cache_bytes"] == 72
+    assert measured_stats["device_cache_active_leases"] == 0
+    assert measured_stats["dequant_cache_active_leases"] == 0
+    assert measured_stats["active_leases"] == 0
+    assert runtime.close_calls == []
+    assert store.close_calls == []
+
+
 def test_vllm_glm_device_cache_uses_lru_eviction():
     adapter, runtime, _, _, _, _ = device_runtime_for_tiny_glm(
         max_resident_experts=5,
