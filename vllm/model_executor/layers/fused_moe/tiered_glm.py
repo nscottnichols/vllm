@@ -1822,6 +1822,16 @@ class DeviceWeightRuntimeGlmTensorProvider:
         with self._prefetch_stats_lock:
             self._prefetch_successes += 1
 
+    def begin_runtime_pass(self) -> None:
+        begin_runtime_pass = getattr(
+            self._runtime,
+            "begin_runtime_pass",
+            None,
+        )
+        if not callable(begin_runtime_pass):
+            raise ValueError("Tiered GLM runtime does not support runtime passes")
+        begin_runtime_pass()
+
     def begin_sequence_turn(self) -> None:
         begin_sequence_turn = getattr(
             self._runtime,

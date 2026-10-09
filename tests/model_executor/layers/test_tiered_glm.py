@@ -1325,6 +1325,26 @@ def test_vllm_glm_provider_forwards_sequence_turn_boundaries():
         unsupported.begin_sequence_turn()
 
 
+def test_vllm_glm_provider_forwards_runtime_pass_boundaries():
+    calls: list[bool] = []
+    runtime = SimpleNamespace(begin_runtime_pass=lambda: calls.append(True))
+    provider = DeviceWeightRuntimeGlmTensorProvider(
+        runtime=runtime,
+        adapter=SimpleNamespace(),
+    )
+
+    provider.begin_runtime_pass()
+
+    assert calls == [True]
+
+    unsupported = DeviceWeightRuntimeGlmTensorProvider(
+        runtime=SimpleNamespace(),
+        adapter=SimpleNamespace(),
+    )
+    with pytest.raises(ValueError, match="does not support runtime passes"):
+        unsupported.begin_runtime_pass()
+
+
 def test_vllm_glm_path_uses_device_runtime_and_selected_experts_only():
     adapter, runtime, manifest, records, payload, store = device_runtime_for_tiny_glm(
         device_budget_bytes=600,
