@@ -8,6 +8,7 @@ import hashlib
 import math
 import sys
 import threading
+import time
 from concurrent.futures import Future
 from contextlib import contextmanager
 from pathlib import Path
@@ -226,9 +227,34 @@ def all_resident_reference(
 
 
 class RecordingMemoryWeightStore(MemoryWeightStore):
-    def __init__(self, objects: dict[str, bytes]) -> None:
+    def __init__(
+        self,
+        objects: dict[str, bytes],
+        unit_records: dict[str, dict[str, object]] | None = None,
+    ) -> None:
         super().__init__(objects)
         self.reads: list[tuple[str, int, int]] = []
+        self.read_units_calls: list[tuple[str, ...]] = []
+        self._unit_records = unit_records or {}
+        self._storage_key = next(iter(objects))
+        self.before_read_units = None
+
+    def read_units(self, unit_ids: tuple[str, ...]) -> dict[str, bytes]:
+        requested = tuple(unit_ids)
+        self.read_units_calls.append(requested)
+        if self.before_read_units is not None:
+            self.before_read_units()
+        return {
+            unit_id: self.read(
+                self._unit_records[unit_id].get(
+                    "storage_key",
+                    self._storage_key,
+                ),
+                self._unit_records[unit_id]["offset_bytes"],
+                self._unit_records[unit_id]["length_bytes"],
+            )
+            for unit_id in requested
+        }
 
     def read(self, storage_key: str, offset_bytes: int, length_bytes: int) -> bytes:
         self.reads.append((storage_key, offset_bytes, length_bytes))
@@ -585,9 +611,7 @@ def test_eager_route_replay_prefetch_missing_next_layer_fails_closed():
     with pytest.raises(RuntimeError, match="prefetch was missing for layer 4"):
         provider.request_experts(demands)
 
-    assert not any(
-        unit_id.startswith("model.layers.4.") for unit_id in created_tensors
-    )
+    assert not any(unit_id.startswith("model.layers.4.") for unit_id in created_tensors)
     stats = provider.stats()
     assert stats["route_replay_next_layer_prefetch_fallbacks"] == 1
     assert stats["route_replay_next_layer_prefetch_hits"] == 0
@@ -618,7 +642,10 @@ def device_runtime_for_tiny_glm(
             ]
         ).hexdigest()
     adapter = Glm53Adapter(manifest)
-    store = RecordingMemoryWeightStore({manifest["storage_key"]: payload})
+    store = RecordingMemoryWeightStore(
+        {manifest["storage_key"]: payload},
+        {record["unit_id"]: record for record in manifest["records"]},
+    )
     manager = ResidencyManager(slot_count=slot_count, slot_capacity_bytes=8)
     runtime = DeviceWeightRuntime(
         adapter=adapter,
@@ -714,6 +741,25 @@ class ChunkRecordingProvider:
 
     def stats(self):
         return self._provider.stats()
+
+
+class CurrentLayerChunkRecordingProvider:
+    def __init__(self, provider):
+        self._provider = provider
+        self.execution_calls: list[tuple[int, tuple[tuple[int, ...], ...]]] = []
+        self.enable_current_layer_chunked_overlap = True
+
+    def run_current_layer_expert_chunks(self, layer_id, execution_chunks, callback):
+        normalized = tuple(tuple(chunk) for chunk in execution_chunks)
+        self.execution_calls.append((layer_id, normalized))
+        return self._provider.run_current_layer_expert_chunks(
+            layer_id,
+            normalized,
+            callback,
+        )
+
+    def reserve_execution_scratch(self, scratch_bytes):
+        return self._provider.reserve_execution_scratch(scratch_bytes)
 
 
 class FakeBatchedLeaseSet:
@@ -833,6 +879,9 @@ class RecordingDeviceRuntime:
 
     def drain_prefetches(self):
         return self._runtime.drain_prefetches()
+
+    def __getattr__(self, name):
+        return getattr(self._runtime, name)
 
 
 def test_vllm_glm_path_routes_and_materializes_layers_3_and_77():
@@ -1033,6 +1082,692 @@ def test_partition_rows_by_expert_union_defaults_to_routing_width():
     ]
 
 
+def test_current_layer_chunked_overlap_preserves_exact_row_partition_unions():
+    adapter, runtime, manifest, records, payload, _ = device_runtime_for_tiny_glm(
+        max_resident_experts=9,
+        slot_count=18,
+        device_budget_bytes=900,
+    )
+    inner_provider = DeviceWeightRuntimeGlmTensorProvider(
+        runtime=runtime,
+        adapter=adapter,
+        enable_current_layer_chunked_overlap=True,
+        current_layer_chunk_in_flight_bytes=120,
+    )
+    provider = CurrentLayerChunkRecordingProvider(inner_provider)
+    method = TieredGlm53MoEMethod(SimpleNamespace(), provider=provider)
+    hidden_states = torch.ones((2, 3), dtype=torch.bfloat16)
+    topk_weights = torch.full((2, 8), 0.125, dtype=torch.float32)
+    topk_ids = torch.tensor(
+        [list(range(8)), list(range(1, 9))],
+        dtype=torch.int32,
+    )
+    expected = all_resident_reference(
+        hidden_states,
+        topk_weights,
+        topk_ids,
+        all_resident_experts(
+            adapter,
+            records,
+            payload,
+            tuple(range(10)),
+        ),
+    )
+
+    result = method.apply(
+        layer=FakeRoutedExpertsLayer(),
+        x=hidden_states,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        shared_experts=None,
+        shared_experts_input=None,
+    )
+
+    assert torch.allclose(result, expected, rtol=0.0, atol=0.0)
+    assert provider.execution_calls == [
+        (
+            3,
+            (
+                tuple(range(8)),
+                tuple(range(1, 9)),
+            ),
+        )
+    ]
+
+
+def test_current_layer_chunked_output_matches_request_experts_path():
+    baseline = device_runtime_for_tiny_glm(
+        max_resident_experts=9,
+        slot_count=18,
+        device_budget_bytes=900,
+    )
+    chunked = device_runtime_for_tiny_glm(
+        max_resident_experts=9,
+        slot_count=18,
+        device_budget_bytes=900,
+    )
+    baseline_provider = DeviceWeightRuntimeGlmTensorProvider(
+        runtime=baseline[1],
+        adapter=baseline[0],
+    )
+    chunked_provider = DeviceWeightRuntimeGlmTensorProvider(
+        runtime=chunked[1],
+        adapter=chunked[0],
+        enable_current_layer_chunked_overlap=True,
+        current_layer_chunk_in_flight_bytes=120,
+    )
+    baseline_method = TieredGlm53MoEMethod(
+        SimpleNamespace(),
+        provider=baseline_provider,
+    )
+    chunked_method = TieredGlm53MoEMethod(
+        SimpleNamespace(),
+        provider=chunked_provider,
+    )
+    hidden_states = torch.randn((2, 3), generator=torch.Generator().manual_seed(42))
+    topk_weights = torch.full((2, 8), 0.125, dtype=torch.float32)
+    topk_ids = torch.tensor(
+        [list(range(8)), list(range(1, 9))],
+        dtype=torch.int32,
+    )
+
+    baseline_result = baseline_method.apply(
+        layer=FakeRoutedExpertsLayer(),
+        x=hidden_states,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        shared_experts=None,
+        shared_experts_input=None,
+    )
+    chunked_result = chunked_method.apply(
+        layer=FakeRoutedExpertsLayer(),
+        x=hidden_states,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        shared_experts=None,
+        shared_experts_input=None,
+    )
+
+    assert torch.equal(baseline_result, chunked_result)
+    assert baseline[1].stats()["active_leases"] == 0
+    assert chunked[1].stats()["active_leases"] == 0
+
+
+def test_eight_expert_execution_chunk_uses_two_bounded_reads():
+    adapter, runtime, _manifest, records, payload, store = device_runtime_for_tiny_glm(
+        max_resident_experts=8,
+        slot_count=18,
+        device_budget_bytes=600,
+    )
+    provider = DeviceWeightRuntimeGlmTensorProvider(
+        runtime=runtime,
+        adapter=adapter,
+        enable_current_layer_chunked_overlap=True,
+        current_layer_chunk_in_flight_bytes=120,
+    )
+    method = TieredGlm53MoEMethod(SimpleNamespace(), provider=provider)
+    hidden_states = torch.ones((1, 3), dtype=torch.bfloat16)
+    topk_weights = torch.full((1, 8), 0.125, dtype=torch.float32)
+    topk_ids = torch.tensor([list(range(8))], dtype=torch.int32)
+    expected = all_resident_reference(
+        hidden_states,
+        topk_weights,
+        topk_ids,
+        all_resident_experts(adapter, records, payload, tuple(range(10))),
+    )
+
+    result = method.apply(
+        layer=FakeRoutedExpertsLayer(),
+        x=hidden_states,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        shared_experts=None,
+        shared_experts_input=None,
+    )
+
+    assert torch.allclose(result, expected, rtol=0.0, atol=0.0)
+    assert len(store.read_units_calls) == 2
+    assert all(len(read_call) == 24 for read_call in store.read_units_calls)
+    stats = provider.stats()
+    assert stats["current_layer_chunk_execution_chunks"] == 1
+    assert stats["current_layer_chunk_read_chunks"] == 2
+    assert stats["current_layer_chunk_in_flight_current_bytes"] == 0
+    assert stats["current_layer_chunk_reserved_device_bytes"] == 0
+    assert runtime.stats()["active_leases"] == 0
+
+
+def test_current_layer_chunk_full_device_cache_hit_uses_no_runtime_leases():
+    fixture = device_runtime_for_tiny_glm(
+        max_resident_experts=8,
+        slot_count=18,
+        device_budget_bytes=900,
+    )
+    adapter, runtime, _manifest, records, payload, store = fixture
+    provider = DeviceWeightRuntimeGlmTensorProvider(
+        runtime=runtime,
+        adapter=adapter,
+        device_cache_budget_bytes=300,
+        device_cache_policy="causal-turn-frequency-slru",
+        layer_quota_groups=8,
+        layer_quota_bytes=300,
+        enable_current_layer_chunked_overlap=True,
+        current_layer_chunk_in_flight_bytes=120,
+    )
+    demands = [
+        demand
+        for expert_id in range(8)
+        for demand in glm_expert_demands(adapter, expert_id)
+    ]
+    with provider.request_experts(demands):
+        pass
+    read_calls_before = len(store.read_units_calls)
+    original_callback = glm_53_tiered_execution_callback
+    callback_runtime_leases: list[int] = []
+    callback_cache_leases: list[int] = []
+
+    def recording_callback(hidden_states, weights, topk_ids, experts):
+        callback_runtime_leases.append(runtime.stats()["active_leases"])
+        callback_cache_leases.append(provider.stats()["device_cache_active_leases"])
+        return original_callback(hidden_states, weights, topk_ids, experts)
+
+    provider.execution_callback = recording_callback
+    method = TieredGlm53MoEMethod(SimpleNamespace(), provider=provider)
+    hidden_states = torch.ones((1, 3), dtype=torch.bfloat16)
+    topk_weights = torch.full((1, 8), 0.125, dtype=torch.float32)
+    topk_ids = torch.tensor([list(range(8))], dtype=torch.int32)
+    expected = all_resident_reference(
+        hidden_states,
+        topk_weights,
+        topk_ids,
+        all_resident_experts(adapter, records, payload, tuple(range(10))),
+    )
+
+    result = method.apply(
+        layer=FakeRoutedExpertsLayer(),
+        x=hidden_states,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        shared_experts=None,
+        shared_experts_input=None,
+    )
+
+    assert torch.allclose(result, expected, rtol=0.0, atol=0.0)
+    assert len(store.read_units_calls) == read_calls_before
+    assert callback_runtime_leases == [0]
+    assert callback_cache_leases == [24]
+    runtime_stats = runtime.stats()
+    assert runtime_stats["active_leases"] == 0
+    assert runtime_stats["resident_groups"] == 8
+    provider_stats = provider.stats()
+    assert provider_stats["device_cache_active_leases"] == 0
+    assert provider_stats["device_cache_policy"] == "causal-turn-frequency-slru"
+
+
+def test_current_layer_chunk_mixed_device_cache_reads_only_uncached_experts():
+    fixture = device_runtime_for_tiny_glm(
+        max_resident_experts=9,
+        slot_count=18,
+        device_budget_bytes=900,
+    )
+    adapter, runtime, _manifest, records, payload, store = fixture
+    provider = DeviceWeightRuntimeGlmTensorProvider(
+        runtime=runtime,
+        adapter=adapter,
+        device_cache_budget_bytes=300,
+        enable_current_layer_chunked_overlap=True,
+        current_layer_chunk_in_flight_bytes=120,
+    )
+    demands = [
+        demand
+        for expert_id in range(4)
+        for demand in glm_expert_demands(adapter, expert_id)
+    ]
+    with provider.request_experts(demands):
+        pass
+    read_calls_before = len(store.read_units_calls)
+    callback_runtime_leases: list[int] = []
+    callback_cache_leases: list[int] = []
+
+    def recording_callback(hidden_states, weights, topk_ids, experts):
+        callback_runtime_leases.append(runtime.stats()["active_leases"])
+        callback_cache_leases.append(provider.stats()["device_cache_active_leases"])
+        return glm_53_tiered_execution_callback(
+            hidden_states,
+            weights,
+            topk_ids,
+            experts,
+        )
+
+    provider.execution_callback = recording_callback
+    method = TieredGlm53MoEMethod(SimpleNamespace(), provider=provider)
+    hidden_states = torch.ones((2, 3), dtype=torch.bfloat16)
+    topk_weights = torch.full((2, 8), 0.125, dtype=torch.float32)
+    topk_ids = torch.tensor(
+        [list(range(8)), list(range(1, 9))],
+        dtype=torch.int32,
+    )
+    expected = all_resident_reference(
+        hidden_states,
+        topk_weights,
+        topk_ids,
+        all_resident_experts(adapter, records, payload, tuple(range(10))),
+    )
+
+    result = method.apply(
+        layer=FakeRoutedExpertsLayer(),
+        x=hidden_states,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        shared_experts=None,
+        shared_experts_input=None,
+    )
+
+    assert torch.allclose(result, expected, rtol=0.0, atol=0.0)
+    assert len(store.read_units_calls) == read_calls_before + 2
+    first_uncached_units = {
+        unit_id
+        for expert_id in range(4, 8)
+        for unit_id in adapter.expert_unit_ids(expert_id, layer_id=3)
+    }
+    second_uncached_units = set(
+        adapter.expert_unit_ids(8, layer_id=3),
+    )
+    assert set(store.read_units_calls[-2]) == first_uncached_units
+    assert set(store.read_units_calls[-1]) == second_uncached_units
+    assert callback_runtime_leases == [4, 1]
+    assert callback_cache_leases == [45, 24]
+    assert runtime.stats()["active_leases"] == 0
+    assert provider.stats()["device_cache_active_leases"] == 0
+
+
+def test_current_layer_chunk_device_cache_physical_reads_match_request_experts():
+    baseline = device_runtime_for_tiny_glm(
+        max_resident_experts=9,
+        slot_count=18,
+        device_budget_bytes=900,
+    )
+    chunked = device_runtime_for_tiny_glm(
+        max_resident_experts=9,
+        slot_count=18,
+        device_budget_bytes=900,
+    )
+    baseline_provider = DeviceWeightRuntimeGlmTensorProvider(
+        runtime=baseline[1],
+        adapter=baseline[0],
+        device_cache_budget_bytes=300,
+    )
+    chunked_provider = DeviceWeightRuntimeGlmTensorProvider(
+        runtime=chunked[1],
+        adapter=chunked[0],
+        device_cache_budget_bytes=300,
+        enable_current_layer_chunked_overlap=True,
+        current_layer_chunk_in_flight_bytes=120,
+    )
+    for provider, provider_adapter in (
+        (baseline_provider, baseline[0]),
+        (chunked_provider, chunked[0]),
+    ):
+        demands = [
+            demand
+            for expert_id in range(4)
+            for demand in glm_expert_demands(provider_adapter, expert_id)
+        ]
+        with provider.request_experts(demands):
+            pass
+    baseline_reads_before = len(baseline[5].reads)
+    chunked_reads_before = len(chunked[5].reads)
+    baseline_method = TieredGlm53MoEMethod(
+        SimpleNamespace(),
+        provider=baseline_provider,
+    )
+    chunked_method = TieredGlm53MoEMethod(
+        SimpleNamespace(),
+        provider=chunked_provider,
+    )
+    hidden_states = torch.randn((2, 3), generator=torch.Generator().manual_seed(41))
+    topk_weights = torch.full((2, 8), 0.125, dtype=torch.float32)
+    topk_ids = torch.tensor(
+        [list(range(8)), list(range(1, 9))],
+        dtype=torch.int32,
+    )
+    apply_arguments = {
+        "layer": FakeRoutedExpertsLayer(),
+        "x": hidden_states,
+        "topk_weights": topk_weights,
+        "topk_ids": topk_ids,
+        "shared_experts": None,
+        "shared_experts_input": None,
+    }
+
+    baseline_result = baseline_method.apply(**apply_arguments)
+    chunked_result = chunked_method.apply(**apply_arguments)
+
+    assert torch.equal(baseline_result, chunked_result)
+    baseline_reads = baseline[5].reads[baseline_reads_before:]
+    chunked_reads = chunked[5].reads[chunked_reads_before:]
+    assert baseline_reads == chunked_reads
+    assert sum(read[2] for read in baseline_reads) == sum(
+        read[2] for read in chunked_reads
+    )
+    assert baseline[1].stats()["active_leases"] == 0
+    assert chunked[1].stats()["active_leases"] == 0
+    assert baseline_provider.stats()["device_cache_active_leases"] == 0
+    assert chunked_provider.stats()["device_cache_active_leases"] == 0
+
+
+def test_current_layer_chunk_callback_failure_releases_device_cache_leases():
+    fixture = device_runtime_for_tiny_glm(
+        max_resident_experts=8,
+        slot_count=18,
+        device_budget_bytes=900,
+    )
+    adapter, runtime, _manifest, _records, _payload, _store = fixture
+    provider = DeviceWeightRuntimeGlmTensorProvider(
+        runtime=runtime,
+        adapter=adapter,
+        device_cache_budget_bytes=300,
+        enable_current_layer_chunked_overlap=True,
+        current_layer_chunk_in_flight_bytes=120,
+    )
+
+    def failing_callback(_hidden_states, _weights, _topk_ids, _experts):
+        raise RuntimeError("synthetic current-layer cache callback failure")
+
+    provider.execution_callback = failing_callback
+    method = TieredGlm53MoEMethod(SimpleNamespace(), provider=provider)
+    with pytest.raises(RuntimeError, match="current-layer cache callback"):
+        method.apply(
+            layer=FakeRoutedExpertsLayer(),
+            x=torch.ones((1, 3), dtype=torch.bfloat16),
+            topk_weights=torch.full((1, 8), 0.125, dtype=torch.float32),
+            topk_ids=torch.tensor([list(range(8))], dtype=torch.int32),
+            shared_experts=None,
+            shared_experts_input=None,
+        )
+
+    runtime_stats = runtime.stats()
+    provider_stats = provider.stats()
+    assert runtime_stats["active_leases"] == 0
+    assert runtime_stats["current_layer_chunk_scheduler_reserved_device_bytes"] == 0
+    assert provider_stats["device_cache_active_leases"] == 0
+    assert provider_stats["device_cache_bytes"] > 0
+    assert len(provider._device_cache) == 24
+
+
+def test_current_layer_chunk_projection_failure_releases_device_cache_leases():
+    fixture = device_runtime_for_tiny_glm(
+        max_resident_experts=8,
+        slot_count=18,
+        device_budget_bytes=900,
+    )
+    adapter, runtime, _manifest, _records, _payload, _store = fixture
+    provider = DeviceWeightRuntimeGlmTensorProvider(
+        runtime=runtime,
+        adapter=adapter,
+        device_cache_budget_bytes=300,
+        enable_current_layer_chunked_overlap=True,
+        current_layer_chunk_in_flight_bytes=120,
+    )
+    demands = [
+        demand
+        for expert_id in range(4)
+        for demand in glm_expert_demands(adapter, expert_id)
+    ]
+    with provider.request_experts(demands):
+        pass
+
+    def failing_cache_projection(_cache_key, _projection):
+        raise RuntimeError("synthetic current-layer cache projection failure")
+
+    provider._cache_projection = failing_cache_projection
+    method = TieredGlm53MoEMethod(SimpleNamespace(), provider=provider)
+    with pytest.raises(
+        RuntimeError,
+        match="synthetic current-layer cache projection failure",
+    ):
+        method.apply(
+            layer=FakeRoutedExpertsLayer(),
+            x=torch.ones((1, 3), dtype=torch.bfloat16),
+            topk_weights=torch.full((1, 8), 0.125, dtype=torch.float32),
+            topk_ids=torch.tensor([list(range(8))], dtype=torch.int32),
+            shared_experts=None,
+            shared_experts_input=None,
+        )
+
+    runtime_stats = runtime.stats()
+    provider_stats = provider.stats()
+    assert runtime_stats["active_leases"] == 0
+    assert runtime_stats["current_layer_chunk_scheduler_reserved_device_bytes"] == 0
+    assert provider_stats["device_cache_active_leases"] == 0
+
+
+def test_current_layer_chunk_callback_precedes_release_and_overlaps_next_read():
+    fixture = device_runtime_for_tiny_glm(
+        max_resident_experts=9,
+        slot_count=18,
+        device_budget_bytes=900,
+    )
+    adapter, runtime, _manifest, _records, _payload, store = fixture
+    next_read_started = threading.Event()
+    next_read_can_continue = threading.Event()
+
+    def block_next_read() -> None:
+        if len(store.read_units_calls) == 3:
+            next_read_started.set()
+            assert next_read_can_continue.wait(timeout=5)
+
+    store.before_read_units = block_next_read
+    provider = DeviceWeightRuntimeGlmTensorProvider(
+        runtime=runtime,
+        adapter=adapter,
+        enable_current_layer_chunked_overlap=True,
+        current_layer_chunk_in_flight_bytes=120,
+    )
+    callback_order: list[tuple[int, int]] = []
+
+    def recording_callback(hidden_states, _weights, topk_ids, _experts):
+        first_expert_id = int(topk_ids[0, 0].item())
+        callback_order.append((first_expert_id, runtime.stats()["active_leases"]))
+        if first_expert_id == 0:
+            assert next_read_started.wait(timeout=5)
+            next_read_can_continue.set()
+            time.sleep(0.01)
+        return torch.zeros_like(hidden_states)
+
+    provider.execution_callback = recording_callback
+    method = TieredGlm53MoEMethod(SimpleNamespace(), provider=provider)
+    hidden_states = torch.ones((2, 3), dtype=torch.bfloat16)
+    topk_weights = torch.full((2, 8), 0.125, dtype=torch.float32)
+    topk_ids = torch.tensor(
+        [list(range(8)), list(range(1, 9))],
+        dtype=torch.int32,
+    )
+
+    result = method.apply(
+        layer=FakeRoutedExpertsLayer(),
+        x=hidden_states,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        shared_experts=None,
+        shared_experts_input=None,
+    )
+
+    assert torch.equal(result, torch.zeros_like(hidden_states))
+    assert [entry[0] for entry in callback_order] == [0, 1]
+    assert all(entry[1] == 8 for entry in callback_order)
+    assert runtime.stats()["active_leases"] == 0
+    stats = provider.stats()
+    assert stats["current_layer_chunk_useful_read_chunks"] >= 1
+    assert stats["current_layer_chunk_overlap_seconds"] > 0.0
+
+
+def test_current_layer_chunk_callback_failure_cleans_up_leases_and_reservations():
+    fixture = device_runtime_for_tiny_glm(
+        max_resident_experts=8,
+        slot_count=18,
+        device_budget_bytes=600,
+    )
+    adapter, runtime, _manifest, _records, _payload, _store = fixture
+    provider = DeviceWeightRuntimeGlmTensorProvider(
+        runtime=runtime,
+        adapter=adapter,
+        enable_current_layer_chunked_overlap=True,
+        current_layer_chunk_in_flight_bytes=120,
+    )
+
+    def failing_callback(_hidden_states, _weights, _topk_ids, _experts):
+        raise RuntimeError("synthetic current-layer chunk callback failure")
+
+    provider.execution_callback = failing_callback
+    method = TieredGlm53MoEMethod(SimpleNamespace(), provider=provider)
+    with pytest.raises(RuntimeError, match="synthetic current-layer chunk callback"):
+        method.apply(
+            layer=FakeRoutedExpertsLayer(),
+            x=torch.ones((1, 3), dtype=torch.bfloat16),
+            topk_weights=torch.full((1, 8), 0.125, dtype=torch.float32),
+            topk_ids=torch.tensor([list(range(8))], dtype=torch.int32),
+            shared_experts=None,
+            shared_experts_input=None,
+        )
+
+    runtime_stats = runtime.stats()
+    assert runtime_stats["active_leases"] == 0
+    assert runtime_stats["resident_groups"] == 0
+    assert runtime_stats["resident_units"] == 0
+    assert runtime_stats["current_layer_chunk_scheduler_reserved_device_bytes"] == 0
+    provider_stats = provider.stats()
+    assert provider_stats["current_layer_chunk_in_flight_current_bytes"] == 0
+    assert provider_stats["current_layer_chunk_reserved_device_bytes"] == 0
+    assert provider_stats["current_layer_chunk_execution_chunks"] == 1
+
+
+def test_current_layer_chunk_timings_exclude_callback_time():
+    fixture = device_runtime_for_tiny_glm(
+        max_resident_experts=8,
+        slot_count=18,
+        device_budget_bytes=600,
+    )
+    adapter, runtime, _manifest, _records, _payload, store = fixture
+    read_can_continue = threading.Event()
+
+    def delay_first_read() -> None:
+        if len(store.read_units_calls) == 1:
+            time.sleep(0.04)
+            read_can_continue.set()
+
+    store.before_read_units = delay_first_read
+    timings = TieredGlmApplyTimings()
+    provider = DeviceWeightRuntimeGlmTensorProvider(
+        runtime=runtime,
+        adapter=adapter,
+        enable_current_layer_chunked_overlap=True,
+        current_layer_chunk_in_flight_bytes=120,
+        apply_timings=timings,
+    )
+
+    def sleeping_callback(hidden_states, _weights, _topk_ids, _experts):
+        time.sleep(0.06)
+        return torch.zeros_like(hidden_states)
+
+    provider.execution_callback = sleeping_callback
+    method = TieredGlm53MoEMethod(SimpleNamespace(), provider=provider)
+
+    result = method.apply(
+        layer=FakeRoutedExpertsLayer(),
+        x=torch.ones((1, 3), dtype=torch.bfloat16),
+        topk_weights=torch.full((1, 8), 0.125, dtype=torch.float32),
+        topk_ids=torch.tensor([list(range(8))], dtype=torch.int32),
+        shared_experts=None,
+        shared_experts_input=None,
+    )
+
+    assert torch.equal(result, torch.zeros((1, 3), dtype=torch.bfloat16))
+    assert read_can_continue.is_set()
+    metrics = timings.metrics()
+    assert metrics["callback_seconds"] >= 0.055
+    assert metrics["apply_provider_request_seconds"] >= 0.035
+    assert metrics["apply_provider_request_seconds"] < metrics["callback_seconds"]
+    assert metrics["apply_provider_request_count"] == 1
+    provider_stats = provider.stats()
+    assert (
+        metrics["apply_provider_request_seconds"]
+        == provider_stats["current_layer_chunk_wait_seconds"]
+        + provider_stats["current_layer_projection_seconds"]
+    )
+    assert provider_stats["current_layer_chunk_wait_seconds"] >= 0.035
+    assert (
+        provider_stats["current_layer_chunk_wait_seconds"] < metrics["callback_seconds"]
+    )
+    assert provider_stats["current_layer_chunk_in_flight_current_bytes"] == 0
+    assert provider_stats["current_layer_chunk_reserved_device_bytes"] == 0
+    runtime_stats = runtime.stats()
+    assert runtime_stats["current_layer_chunk_scheduler_wait_seconds"] >= 0.035
+    assert runtime_stats["active_leases"] == 0
+    assert runtime_stats["current_layer_chunk_scheduler_reserved_device_bytes"] == 0
+
+
+def test_current_layer_chunked_overlap_skips_synchronous_prefetch():
+    fixture = device_runtime_for_tiny_glm(
+        max_resident_experts=8,
+        slot_count=18,
+        device_budget_bytes=600,
+    )
+    adapter, runtime, _manifest, _records, _payload, _store = fixture
+    recording_runtime = RecordingDeviceRuntime(runtime)
+    provider = DeviceWeightRuntimeGlmTensorProvider(
+        runtime=recording_runtime,
+        adapter=adapter,
+        enable_prefetch=True,
+        enable_current_layer_chunked_overlap=True,
+        current_layer_chunk_in_flight_bytes=120,
+    )
+    method = TieredGlm53MoEMethod(SimpleNamespace(), provider=provider)
+
+    method.apply(
+        layer=FakeRoutedExpertsLayer(),
+        x=torch.ones((1, 3), dtype=torch.bfloat16),
+        topk_weights=torch.full((1, 8), 0.125, dtype=torch.float32),
+        topk_ids=torch.tensor([list(range(8))], dtype=torch.int32),
+        shared_experts=None,
+        shared_experts_input=None,
+    )
+
+    assert recording_runtime.prefetch_calls == []
+    assert recording_runtime.submit_calls == []
+    assert runtime.stats()["active_leases"] == 0
+
+
+def test_current_layer_chunked_overlap_rejects_future_layer_and_derived_caches():
+    fixture = device_runtime_for_tiny_glm()
+    adapter, runtime, _manifest, _records, _payload, _store = fixture
+
+    with pytest.raises(ValueError, match="cannot use next-layer prefetch"):
+        DeviceWeightRuntimeGlmTensorProvider(
+            runtime=runtime,
+            adapter=adapter,
+            enable_next_layer_prefetch=True,
+            enable_current_layer_chunked_overlap=True,
+            current_layer_chunk_in_flight_bytes=120,
+        )
+    cache_provider = DeviceWeightRuntimeGlmTensorProvider(
+        runtime=runtime,
+        adapter=adapter,
+        device_cache_budget_bytes=128,
+        enable_current_layer_chunked_overlap=True,
+        current_layer_chunk_in_flight_bytes=120,
+    )
+    assert cache_provider.uses_derived_cache
+    assert cache_provider.stats()["device_cache_budget_bytes"] == 128
+    with pytest.raises(ValueError, match="cannot use the dequant cache"):
+        DeviceWeightRuntimeGlmTensorProvider(
+            runtime=runtime,
+            adapter=adapter,
+            dequant_cache_budget_bytes=128,
+            enable_current_layer_chunked_overlap=True,
+            current_layer_chunk_in_flight_bytes=120,
+        )
+
+
 def test_provider_max_expert_union_uses_routing_width_not_resident_capacity():
     provider = SimpleNamespace(stats=lambda: {"max_resident_experts": 1234})
     method = TieredGlm53MoEMethod(SimpleNamespace(), provider=provider)
@@ -1196,9 +1931,7 @@ def test_vllm_glm_path_consumes_chunk_output_before_release():
         def reserve_execution_scratch(self, scratch_bytes):
             self._scratch_reservations += 1
             label = (
-                "output-scratch"
-                if self._scratch_reservations == 1
-                else "chunk-scratch"
+                "output-scratch" if self._scratch_reservations == 1 else "chunk-scratch"
             )
 
             @contextmanager
@@ -2361,6 +3094,10 @@ def test_glm_single_provider_warmup_disables_and_restores_derived_caches():
         device_cache_budget_bytes=60,
         dequant_cache_budget_bytes=72,
     )
+    clear_verified_payload_cache_calls = []
+    runtime.clear_verified_payload_caches = lambda: (
+        clear_verified_payload_cache_calls.append(True)
+    )
     method = TieredGlm53MoEMethod(SimpleNamespace(), provider=provider)
     generator = torch.Generator().manual_seed(2468)
     hidden_states = torch.randn((1, 3), generator=generator, dtype=torch.float32)
@@ -2421,6 +3158,7 @@ def test_glm_single_provider_warmup_disables_and_restores_derived_caches():
     restored_stats = provider.stats()
     assert restored_stats["device_cache_budget_bytes"] == 60
     assert restored_stats["dequant_cache_budget_bytes"] == 72
+    assert clear_verified_payload_cache_calls == [True, True, True, True]
 
     measured_result = method.apply(
         layer=FakeRoutedExpertsLayer(),
@@ -2532,6 +3270,597 @@ def test_vllm_glm_device_cache_policy_selection_and_validation():
             device_cache_budget_bytes=60,
             device_cache_policy="causal-turn-frequency-slru",
         )
+
+
+def weighted_last_n_glm_provider(
+    adapter,
+    runtime,
+    *,
+    layer_quota_groups=1,
+    layer_quota_bytes=30,
+    device_cache_budget_bytes=30,
+):
+    return DeviceWeightRuntimeGlmTensorProvider(
+        runtime=runtime,
+        adapter=adapter,
+        device_cache_budget_bytes=device_cache_budget_bytes,
+        device_cache_policy="causal-weighted-last-n",
+        layer_quota_groups=layer_quota_groups,
+        layer_quota_bytes=layer_quota_bytes,
+    )
+
+
+def test_weighted_last_n_policy_validation_and_incompatibility():
+    adapter, runtime, _, _, _, _ = device_runtime_for_tiny_glm(
+        max_resident_experts=5,
+        slot_count=30,
+        device_budget_bytes=1000,
+    )
+    provider = weighted_last_n_glm_provider(adapter, runtime)
+    stats = provider.stats()
+    assert stats["device_cache_policy"] == "causal-weighted-last-n"
+    assert stats["device_cache_layer_quota_groups"] == 1
+    assert stats["device_cache_layer_quota_bytes"] == 30
+    assert stats["device_cache_history_turns"] == 0
+    assert stats["device_cache_selected_groups"] == 0
+    assert stats["device_cache_selection_source"] == "completed_prior_turns"
+
+    with pytest.raises(ValueError, match="requires layer byte and group quotas"):
+        DeviceWeightRuntimeGlmTensorProvider(
+            runtime=runtime,
+            adapter=adapter,
+            device_cache_budget_bytes=30,
+            device_cache_policy="causal-weighted-last-n",
+        )
+    with pytest.raises(ValueError, match="layer quotas require causal-turn"):
+        DeviceWeightRuntimeGlmTensorProvider(
+            runtime=runtime,
+            adapter=adapter,
+            device_cache_budget_bytes=30,
+            layer_quota_groups=1,
+            layer_quota_bytes=30,
+        )
+    with pytest.raises(ValueError, match="incompatible with causal-weighted-last-n"):
+        DeviceWeightRuntimeGlmTensorProvider(
+            runtime=runtime,
+            adapter=adapter,
+            device_cache_budget_bytes=30,
+            device_cache_policy="causal-weighted-last-n",
+            layer_quota_groups=1,
+            layer_quota_bytes=30,
+            enable_warm_turn_causal_cache=True,
+        )
+
+
+def test_weighted_last_n_uses_only_completed_prior_turns():
+    adapter, runtime, _, _, _, _ = device_runtime_for_tiny_glm(
+        max_resident_experts=5,
+        slot_count=30,
+        device_budget_bytes=1000,
+    )
+    provider = weighted_last_n_glm_provider(adapter, runtime)
+    provider.begin_sequence_turn()
+    with provider.request_experts(glm_expert_demands(adapter, expert_id=0)):
+        pass
+    with provider.request_experts(glm_expert_demands(adapter, expert_id=1)):
+        assert provider._causal_pinned_groups == set()
+        assert provider._current_turn_demand_counts == {(3, 0): 1, (3, 1): 1}
+
+    provider.begin_sequence_turn()
+    assert provider._causal_pinned_groups == {(3, 0)}
+
+    with provider.request_experts(glm_expert_demands(adapter, expert_id=1)):
+        assert provider._causal_pinned_groups == {(3, 0)}
+        assert provider._current_turn_demand_counts == {(3, 1): 1}
+
+    provider.begin_sequence_turn()
+    stats = provider.stats()
+    assert provider._causal_pinned_groups == {(3, 1)}
+    assert stats["device_cache_history_turns"] == 2
+    assert stats["device_cache_selected_groups"] == 1
+    assert stats["device_cache_selection_source"] == "completed_prior_turns"
+    assert stats["device_cache_active_leases"] == 0
+
+
+def test_weighted_last_n_ranks_bounded_completed_history():
+    adapter, runtime, _, _, _, _ = device_runtime_for_tiny_glm(
+        max_resident_experts=5,
+        slot_count=30,
+        device_budget_bytes=1000,
+    )
+    provider = weighted_last_n_glm_provider(adapter, runtime)
+    provider.begin_sequence_turn()
+    for _ in range(3):
+        with provider.request_experts(glm_expert_demands(adapter, expert_id=0)):
+            pass
+    provider.begin_sequence_turn()
+    for _ in range(2):
+        with provider.request_experts(glm_expert_demands(adapter, expert_id=0)):
+            pass
+    provider.begin_sequence_turn()
+    with provider.request_experts(glm_expert_demands(adapter, expert_id=1)):
+        assert provider._causal_pinned_groups == {(3, 0)}
+
+    provider.begin_sequence_turn()
+    assert provider._causal_pinned_groups == {(3, 0)}
+    assert provider.stats()["device_cache_history_turns"] == 3
+
+
+def test_weighted_last_n_bounds_history_to_last_three_turns():
+    adapter, runtime, _, _, _, _ = device_runtime_for_tiny_glm(
+        max_resident_experts=5,
+        slot_count=30,
+        device_budget_bytes=1000,
+    )
+    provider = weighted_last_n_glm_provider(adapter, runtime)
+    provider.begin_sequence_turn()
+    for expert_id in range(4):
+        with provider.request_experts(glm_expert_demands(adapter, expert_id)):
+            pass
+        provider.begin_sequence_turn()
+
+    previous_groups = tuple(provider._previous_turn_groups)
+    assert len(previous_groups) == 3
+    assert (3, 0) not in previous_groups
+    assert provider._causal_pinned_groups == {(3, 3)}
+    assert provider.stats()["device_cache_history_turns"] == 3
+
+
+def test_weighted_last_n_selects_with_per_layer_quotas():
+    adapter, runtime, _, _, _, _ = device_runtime_for_tiny_glm(
+        layer_ids=(3, 4),
+        expert_count=5,
+        max_resident_experts=5,
+        slot_count=30,
+        device_budget_bytes=1000,
+    )
+    group_quota_provider = weighted_last_n_glm_provider(
+        adapter,
+        runtime,
+        layer_quota_groups=1,
+        layer_quota_bytes=120,
+        device_cache_budget_bytes=120,
+    )
+    group_quota_provider.begin_sequence_turn()
+    with group_quota_provider.request_experts(
+        glm_expert_demands(adapter, expert_id=0, layer_id=3)
+    ):
+        pass
+    with group_quota_provider.request_experts(
+        glm_expert_demands(adapter, expert_id=0, layer_id=4)
+    ):
+        pass
+    group_quota_provider.begin_sequence_turn()
+    assert group_quota_provider._causal_pinned_groups == {(3, 0), (4, 0)}
+
+    byte_quota_provider = weighted_last_n_glm_provider(
+        adapter,
+        runtime,
+        layer_quota_groups=2,
+        layer_quota_bytes=30,
+        device_cache_budget_bytes=120,
+    )
+    byte_quota_provider.begin_sequence_turn()
+    for layer_id in (3, 4):
+        for expert_id in (0, 1):
+            with byte_quota_provider.request_experts(
+                glm_expert_demands(adapter, expert_id=expert_id, layer_id=layer_id)
+            ):
+                pass
+    byte_quota_provider.begin_sequence_turn()
+    assert byte_quota_provider._causal_pinned_groups == {(3, 0), (4, 0)}
+
+
+def test_weighted_last_n_admission_and_eviction_respect_pinned_groups():
+    adapter, runtime, _, _, _, _ = device_runtime_for_tiny_glm(
+        max_resident_experts=5,
+        slot_count=30,
+        device_budget_bytes=1000,
+    )
+    provider = weighted_last_n_glm_provider(adapter, runtime)
+    provider.begin_sequence_turn()
+    with provider.request_experts(glm_expert_demands(adapter, expert_id=0)):
+        pass
+    provider.begin_sequence_turn()
+    assert provider._causal_pinned_groups == {(3, 0)}
+    assert provider._protected_groups == {(3, 0)}
+
+    with provider.request_experts(glm_expert_demands(adapter, expert_id=1)):
+        pass
+    stats = provider.stats()
+    assert set(provider._device_cache_groups) == {(3, 0)}
+    assert stats["device_cache_bytes"] == 30
+    assert stats["device_cache_evictions"] == 0
+    assert stats["device_cache_active_leases"] == 0
+
+    provider.begin_sequence_turn()
+    assert provider._causal_pinned_groups == {(3, 1)}
+    with provider.request_experts(glm_expert_demands(adapter, expert_id=1)):
+        pass
+    stats = provider.stats()
+    assert set(provider._device_cache_groups) == {(3, 1)}
+    assert stats["device_cache_bytes"] == 30
+    assert stats["device_cache_evictions"] == 3
+    assert stats["device_cache_active_leases"] == 0
+    assert stats["active_leases"] == 0
+
+
+def test_weighted_last_n_boundary_does_not_prefetch_or_read():
+    adapter, runtime, _, _, _, store = device_runtime_for_tiny_glm(
+        max_resident_experts=5,
+        slot_count=30,
+        device_budget_bytes=1000,
+    )
+    recording_runtime = RecordingDeviceRuntime(runtime)
+    provider = weighted_last_n_glm_provider(adapter, recording_runtime)
+    provider.begin_sequence_turn()
+    with provider.request_experts(glm_expert_demands(adapter, expert_id=0)):
+        pass
+
+    read_count = len(store.read_units_calls)
+    acquire_count = len(recording_runtime.acquire_experts_calls)
+    provider.begin_runtime_pass()
+    provider.begin_sequence_turn()
+
+    assert len(store.read_units_calls) == read_count
+    assert len(recording_runtime.acquire_experts_calls) == acquire_count
+    assert recording_runtime.prefetch_calls == []
+    assert recording_runtime.submit_calls == []
+    stats = provider.stats()
+    assert stats["active_leases"] == 0
+    assert stats["device_cache_active_leases"] == 0
+    assert stats["device_cache_selection_source"] == "completed_prior_turns"
+
+
+def test_weighted_last_n_clear_resets_history_and_selection():
+    adapter, runtime, _, _, _, _ = device_runtime_for_tiny_glm(
+        max_resident_experts=5,
+        slot_count=30,
+        device_budget_bytes=1000,
+    )
+    provider = weighted_last_n_glm_provider(adapter, runtime)
+    provider.begin_sequence_turn()
+    with provider.request_experts(glm_expert_demands(adapter, expert_id=0)):
+        pass
+    provider.begin_sequence_turn()
+    assert provider._previous_turn_groups
+    assert provider._causal_pinned_groups == {(3, 0)}
+
+    provider.clear()
+
+    stats = provider.stats()
+    assert stats["device_cache_bytes"] == 0
+    assert stats["device_cache_active_leases"] == 0
+    assert stats["device_cache_sequence_turns"] == 0
+    assert stats["device_cache_history_turns"] == 0
+    assert stats["device_cache_selected_groups"] == 0
+    assert stats["device_cache_selection_source"] == "completed_prior_turns"
+    assert not provider._previous_turn_groups
+    assert not provider._previous_turn_demand_counts
+    assert not provider._current_turn_groups
+    assert not provider._current_turn_demand_counts
+    assert not provider._causal_pinned_groups
+    assert not provider._protected_groups
+
+
+def warm_turn_causal_glm_provider(adapter, runtime, *, layer_quota_bytes=30):
+    return DeviceWeightRuntimeGlmTensorProvider(
+        runtime=runtime,
+        adapter=adapter,
+        device_cache_budget_bytes=1_073_741_824,
+        device_cache_policy="causal-turn-frequency-slru",
+        layer_quota_groups=1,
+        layer_quota_bytes=layer_quota_bytes,
+        enable_warm_turn_causal_cache=True,
+    )
+
+
+def test_warm_turn_causal_cache_selects_only_immediately_preceding_turn():
+    adapter, runtime, _, _, _, _ = device_runtime_for_tiny_glm(
+        max_resident_experts=5,
+        slot_count=30,
+        device_budget_bytes=1000,
+    )
+    default_provider = DeviceWeightRuntimeGlmTensorProvider(
+        runtime=runtime,
+        adapter=adapter,
+    )
+    assert default_provider.stats()["warm_turn_causal_cache_enabled"] is False
+    assert default_provider.stats()["warm_turn_causal_cache_source"] is None
+
+    provider = warm_turn_causal_glm_provider(adapter, runtime)
+    provider.begin_sequence_turn()
+    with provider.request_experts(glm_expert_demands(adapter, expert_id=0)):
+        pass
+
+    provider.begin_runtime_pass()
+    assert provider._causal_pinned_groups == set()
+
+    provider.begin_sequence_turn()
+    assert provider._causal_pinned_groups == {(3, 0)}
+    with provider.request_experts(glm_expert_demands(adapter, expert_id=1)):
+        pass
+
+    provider.begin_sequence_turn()
+    assert provider._causal_pinned_groups == {(3, 1)}
+    for _ in range(3):
+        with provider.request_experts(glm_expert_demands(adapter, expert_id=2)):
+            assert provider._causal_pinned_groups == {(3, 1)}
+
+    provider.begin_sequence_turn()
+    assert provider._causal_pinned_groups == {(3, 2)}
+    stats = provider.stats()
+    assert stats["warm_turn_causal_cache_enabled"] is True
+    assert stats["warm_turn_causal_cache_prior_turn_pin_count"] == 1
+    assert stats["warm_turn_causal_cache_protected_groups"] == 1
+    assert stats["warm_turn_causal_cache_protected_bytes"] == 30
+    assert stats["warm_turn_causal_cache_source"] == "previous_completed_turn"
+    assert stats["device_cache_sequence_turns"] == 3
+
+    with pytest.raises(ValueError, match="1,073,741,824-byte"):
+        DeviceWeightRuntimeGlmTensorProvider(
+            runtime=runtime,
+            adapter=adapter,
+            device_cache_budget_bytes=30,
+            device_cache_policy="causal-turn-frequency-slru",
+            layer_quota_groups=1,
+            layer_quota_bytes=30,
+            enable_warm_turn_causal_cache=True,
+        )
+
+
+def test_warm_turn_causal_cache_boundary_does_not_prefetch_or_read():
+    adapter, runtime, _, _, _, store = device_runtime_for_tiny_glm(
+        max_resident_experts=5,
+        slot_count=30,
+        device_budget_bytes=1000,
+    )
+    recording_runtime = RecordingDeviceRuntime(runtime)
+    provider = warm_turn_causal_glm_provider(adapter, recording_runtime)
+    provider.begin_sequence_turn()
+    with provider.request_experts(glm_expert_demands(adapter, expert_id=0)):
+        pass
+
+    read_count = len(store.read_units_calls)
+    acquire_count = len(recording_runtime.acquire_experts_calls)
+    provider.begin_runtime_pass()
+    provider.begin_sequence_turn()
+
+    assert len(store.read_units_calls) == read_count
+    assert len(recording_runtime.acquire_experts_calls) == acquire_count
+    assert recording_runtime.prefetch_calls == []
+    assert recording_runtime.submit_calls == []
+    assert provider.stats()["active_leases"] == 0
+    assert provider.stats()["device_cache_active_leases"] == 0
+
+
+def test_warm_turn_causal_cache_preserves_exact_request_path():
+    adapter, runtime, _, records, payload, store = device_runtime_for_tiny_glm(
+        max_resident_experts=5,
+        slot_count=30,
+        device_budget_bytes=1000,
+    )
+    provider = warm_turn_causal_glm_provider(adapter, runtime)
+    method = TieredGlm53MoEMethod(SimpleNamespace(), provider=provider)
+    reference_experts = all_resident_experts(adapter, records, payload, (0, 1))
+    hidden_states = torch.ones((2, 3), dtype=torch.float32)
+    topk_weights = torch.ones((2, 1), dtype=torch.float32)
+    topk_ids = torch.tensor([[0], [0]], dtype=torch.int32)
+    expected_zero = all_resident_reference(
+        hidden_states,
+        topk_weights,
+        topk_ids,
+        reference_experts,
+    )
+
+    assert torch.equal(
+        method.apply(
+            layer=FakeRoutedExpertsLayer(),
+            x=hidden_states,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            shared_experts=None,
+            shared_experts_input=None,
+        ),
+        expected_zero,
+    )
+    provider.begin_sequence_turn()
+    read_count = len(store.read_units_calls)
+    acquire_count = len(runtime.acquire_experts_calls)
+
+    assert torch.equal(
+        method.apply(
+            layer=FakeRoutedExpertsLayer(),
+            x=hidden_states,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            shared_experts=None,
+            shared_experts_input=None,
+        ),
+        expected_zero,
+    )
+    assert len(store.read_units_calls) == read_count
+    assert len(runtime.acquire_experts_calls) == acquire_count
+
+    topk_ids = torch.tensor([[1], [1]], dtype=torch.int32)
+    expected_one = all_resident_reference(
+        hidden_states,
+        topk_weights,
+        topk_ids,
+        reference_experts,
+    )
+    assert torch.equal(
+        method.apply(
+            layer=FakeRoutedExpertsLayer(),
+            x=hidden_states,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            shared_experts=None,
+            shared_experts_input=None,
+        ),
+        expected_one,
+    )
+    assert runtime.acquire_experts_calls[-1] == ((1,), 3)
+    expected_unit_ids = set(adapter.expert_unit_ids(1, layer_id=3))
+    assert {
+        unit_id
+        for unit_ids in store.read_units_calls[read_count:]
+        for unit_id in unit_ids
+    } == expected_unit_ids
+    stats = provider.stats()
+    assert stats["active_leases"] == 0
+    assert stats["device_cache_active_leases"] == 0
+
+
+def test_warm_turn_causal_cache_eviction_stays_bounded():
+    adapter, runtime, _, _, _, _ = device_runtime_for_tiny_glm(
+        max_resident_experts=5,
+        slot_count=30,
+        device_budget_bytes=1000,
+    )
+    provider = warm_turn_causal_glm_provider(adapter, runtime)
+    provider.begin_sequence_turn()
+
+    for expert_id in range(4):
+        with provider.request_experts(glm_expert_demands(adapter, expert_id)):
+            stats = provider.stats()
+            assert stats["device_cache_bytes"] <= 1_073_741_824
+            assert stats["device_cache_peak_bytes"] <= 1_073_741_824
+            assert stats["device_cache_layer_quota_groups"] == 1
+
+    stats = provider.stats()
+    assert stats["device_cache_bytes"] == 30
+    assert stats["device_cache_peak_bytes"] == 30
+    assert stats["device_cache_evictions"] == 9
+    assert stats["device_cache_active_leases"] == 0
+    assert set(provider._device_cache_groups) == {(3, 3)}
+
+
+def test_warm_turn_causal_cache_active_lease_prevents_eviction():
+    adapter, runtime, _, records, payload, _ = device_runtime_for_tiny_glm(
+        max_resident_experts=5,
+        slot_count=30,
+        device_budget_bytes=1000,
+    )
+    provider = warm_turn_causal_glm_provider(adapter, runtime)
+    reference_experts = all_resident_experts(adapter, records, payload, (0, 1))
+    provider.begin_sequence_turn()
+
+    with provider.request_experts(glm_expert_demands(adapter, expert_id=0)) as first:
+        provider.begin_sequence_turn()
+        with provider.request_experts(
+            glm_expert_demands(adapter, expert_id=1)
+        ) as second:
+            stats = provider.stats()
+            assert stats["device_cache_bytes"] == 30
+            assert stats["device_cache_evictions"] == 0
+            assert stats["device_cache_active_leases"] == 3
+            assert stats["active_leases"] == 1
+            for projection in second.experts[1].values():
+                weight_reference = reference_experts[1][projection.weight_unit_id]
+                scale_reference = reference_experts[1][projection.scale_unit_id]
+                assert torch.equal(
+                    projection.weight.view(torch.uint8),
+                    weight_reference.view(torch.uint8),
+                )
+                assert torch.equal(
+                    projection.scale.view(torch.uint8),
+                    scale_reference.view(torch.uint8),
+                )
+
+        assert set(provider._device_cache_groups) == {(3, 0)}
+        assert torch.equal(
+            first.experts[0]["gate_proj"].weight,
+            reference_experts[0][first.experts[0]["gate_proj"].weight_unit_id],
+        )
+
+    stats = provider.stats()
+    assert stats["device_cache_active_leases"] == 0
+    assert stats["active_leases"] == 0
+    assert stats["device_cache_bytes"] == 30
+    assert set(provider._device_cache_groups) == {(3, 0)}
+
+
+def test_warm_turn_causal_cache_clear_resets_history_and_protection():
+    adapter, runtime, _, _, _, _ = device_runtime_for_tiny_glm(
+        max_resident_experts=5,
+        slot_count=30,
+        device_budget_bytes=1000,
+    )
+    provider = warm_turn_causal_glm_provider(adapter, runtime)
+    provider.begin_sequence_turn()
+    with provider.request_experts(glm_expert_demands(adapter, expert_id=0)):
+        pass
+    provider.begin_sequence_turn()
+    assert provider._previous_turn_groups
+    assert provider._causal_pinned_groups == {(3, 0)}
+
+    provider.clear()
+
+    stats = provider.stats()
+    assert stats["device_cache_bytes"] == 0
+    assert stats["device_cache_active_leases"] == 0
+    assert stats["device_cache_sequence_turns"] == 0
+    assert stats["warm_turn_causal_cache_prior_turn_pin_count"] == 0
+    assert stats["warm_turn_causal_cache_protected_groups"] == 0
+    assert stats["warm_turn_causal_cache_protected_bytes"] == 0
+    assert not provider._previous_turn_groups
+    assert not provider._previous_turn_demand_counts
+    assert not provider._causal_pinned_groups
+    assert not provider._protected_groups
+
+
+def test_warm_turn_causal_cache_failure_releases_rollback_leases():
+    adapter, runtime, _, _, _, _ = device_runtime_for_tiny_glm(
+        max_resident_experts=5,
+        slot_count=30,
+        device_budget_bytes=1000,
+    )
+
+    class FailingAcquireRuntime:
+        def __init__(self, runtime):
+            self._runtime = runtime
+
+        def acquire_experts(self, selected_expert_ids, *, layer_id=None):
+            if 1 in selected_expert_ids:
+                raise RuntimeError("synthetic warm-turn acquire failure")
+            return self._runtime.acquire_experts(
+                selected_expert_ids,
+                layer_id=layer_id,
+            )
+
+        def reserve_scratch(self, scratch_bytes):
+            return self._runtime.reserve_scratch(scratch_bytes)
+
+        def stats(self):
+            return self._runtime.stats()
+
+        def __getattr__(self, name):
+            return getattr(self._runtime, name)
+
+    failing_runtime = FailingAcquireRuntime(runtime)
+    provider = warm_turn_causal_glm_provider(adapter, failing_runtime)
+    provider.begin_sequence_turn()
+    with provider.request_experts(glm_expert_demands(adapter, expert_id=0)):
+        pass
+    provider.begin_sequence_turn()
+
+    demands = [
+        *glm_expert_demands(adapter, expert_id=0),
+        *glm_expert_demands(adapter, expert_id=1),
+    ]
+    with pytest.raises(RuntimeError, match="synthetic warm-turn acquire failure"):
+        provider.request_experts(demands)
+
+    stats = provider.stats()
+    assert stats["active_leases"] == 0
+    assert stats["device_cache_active_leases"] == 0
+    assert stats["device_cache_bytes"] == 30
+    assert stats["device_cache_evictions"] == 0
+    assert set(provider._device_cache_groups) == {(3, 0)}
+    assert provider._causal_pinned_groups == {(3, 0)}
+    assert provider._protected_groups == {(3, 0)}
+    assert stats["warm_turn_causal_cache_source"] == "previous_completed_turn"
 
 
 def test_vllm_glm_causal_policy_evicts_whole_expert_groups():
@@ -3537,9 +4866,9 @@ def test_vllm_glm_drain_prefetches_drains_active_and_queued_work():
         adapter=object(),
         enable_next_layer_prefetch=True,
         prefetch_depth=2,
-        next_layer_prediction_provider=lambda layer_id, topk_ids: (1,)
-        if layer_id == 4
-        else (2,),
+        next_layer_prediction_provider=lambda layer_id, topk_ids: (
+            (1,) if layer_id == 4 else (2,)
+        ),
     )
     original_submit_next_prefetch = provider._submit_next_prefetch
     provider._submit_next_prefetch = lambda: None
@@ -4281,8 +5610,8 @@ def test_vllm_glm_provider_uses_one_batched_expert_acquisition():
             )
             assert set(projections) == {"gate_proj", "up_proj", "down_proj"}
             for projection in projections.values():
-                assert (
-                    projection.weight is lease.weight_tensor(projection.weight_unit_id)
+                assert projection.weight is lease.weight_tensor(
+                    projection.weight_unit_id
                 )
                 assert projection.scale is lease.scale_tensor(projection.weight_unit_id)
                 assert projection.scale_unit_id == lease.linked_scale_unit_id(
@@ -4582,18 +5911,27 @@ def test_glm_mtp_model_type_dispatches_to_tiered_glm_factory():
             mtp_config,
             "model.layers.78.mlp",
         ) == (TieredGlm53RoutedExperts, {"provider": provider})
-        assert glm_53_tiered_experts(
-            mtp_config,
-            "model.layers.3.mlp",
-        ) is None
-        assert glm_53_tiered_experts(
-            normal_deepseek_mtp_config,
-            "model.layers.27.mlp",
-        ) is None
-        assert glm_53_tiered_experts(
-            glm_base_config,
-            "model.layers.78.mlp",
-        ) is None
+        assert (
+            glm_53_tiered_experts(
+                mtp_config,
+                "model.layers.3.mlp",
+            )
+            is None
+        )
+        assert (
+            glm_53_tiered_experts(
+                normal_deepseek_mtp_config,
+                "model.layers.27.mlp",
+            )
+            is None
+        )
+        assert (
+            glm_53_tiered_experts(
+                glm_base_config,
+                "model.layers.78.mlp",
+            )
+            is None
+        )
     finally:
         clear_glm_53_tiered_experts()
 
@@ -4702,11 +6040,7 @@ def test_tiered_glm_route_controller_captures_exact_router_bits():
 
 def test_tiered_glm_route_controller_replays_exact_router_bits():
     ids, weights = tiered_route_fixture()
-    live_ids = (
-        torch.arange(8, 16, dtype=torch.int32)
-        .repeat(4, 1)
-        .reshape(4, 8)
-    )
+    live_ids = torch.arange(8, 16, dtype=torch.int32).repeat(4, 1).reshape(4, 8)
     live_weights = torch.full_like(live_ids, 0.5, dtype=torch.float32)
     controller = TieredGlmRouteController.replay(ids, weights)
     for layer_index, layer_id in enumerate(range(3, 78)):
@@ -4795,8 +6129,7 @@ def test_tiered_glm_route_controller_stats_are_finite_and_monotonic():
         for key in initial_capture_stats
     )
     assert all(
-        replay_stats[key] >= initial_replay_stats[key]
-        for key in initial_replay_stats
+        replay_stats[key] >= initial_replay_stats[key] for key in initial_replay_stats
     )
 
 
@@ -4832,14 +6165,10 @@ def test_tiered_glm_route_controller_supports_parent_cumulative_replays():
     assert final_stats["replay_layer_count"] == 150
     assert final_stats["apply_count"] == 150
     assert (
-        warmup_stats["replay_layer_count"] - initial_stats["replay_layer_count"]
-        == 75
+        warmup_stats["replay_layer_count"] - initial_stats["replay_layer_count"] == 75
     )
     assert warmup_stats["apply_count"] - initial_stats["apply_count"] == 75
-    assert (
-        final_stats["replay_layer_count"] - warmup_stats["replay_layer_count"]
-        == 75
-    )
+    assert final_stats["replay_layer_count"] - warmup_stats["replay_layer_count"] == 75
     assert final_stats["apply_count"] - warmup_stats["apply_count"] == 75
 
 

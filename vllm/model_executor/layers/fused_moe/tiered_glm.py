@@ -18,6 +18,10 @@ from typing import Any, Protocol, cast
 import torch
 import torch.nn.functional as F
 from tiered_weights.runtime.derived import DerivedTensorCache
+from tiered_weights.runtime.device import (
+    DeviceWeightCurrentLayerChunkPreparation,
+    DeviceWeightCurrentLayerChunkScheduler,
+)
 
 from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
 from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
@@ -52,8 +56,7 @@ class _EagerRouteReplayPrefetch:
     @property
     def byte_count(self) -> int:
         return sum(
-            math.prod(spec[1])
-            * torch.empty((), dtype=spec[2]).element_size()
+            math.prod(spec[1]) * torch.empty((), dtype=spec[2]).element_size()
             for spec in self.tensor_specs
         )
 
@@ -78,13 +81,18 @@ class TieredGlmBatchedTensors(list[torch.Tensor]):
         batch_count: int,
     ) -> None:
         super().__init__(tensors)
-        if (
-            type(batch_count) is not int
-            or batch_count <= 0
-            or batch_count > len(self)
-        ):
+        if type(batch_count) is not int or batch_count <= 0 or batch_count > len(self):
             raise ValueError("invalid Tiered GLM materialization batch count")
         self.batch_count = batch_count
+
+
+@dataclass(slots=True)
+class _CurrentLayerChunkCacheContext:
+    layer_id: int
+    cached_projections: dict[int, dict[str, TieredGlmProjection]]
+    projection_names: dict[int, tuple[str, ...]]
+    uncached_expert_ids: tuple[int, ...]
+    cache_keys: list[tuple[int, int, str]]
 
 
 class TieredGlmExecutionTimings:
@@ -775,14 +783,11 @@ class TieredGlmRouteController:
                 self._replay_layer_ids
             )
             raise RuntimeError(
-                "Tiered GLM replay is missing layers: "
-                f"{sorted(missing_layer_ids)}"
+                f"Tiered GLM replay is missing layers: {sorted(missing_layer_ids)}"
             )
 
     @staticmethod
-    def _validate_dimensions(
-        row_count: int, layer_count: int, top_k: int
-    ) -> None:
+    def _validate_dimensions(row_count: int, layer_count: int, top_k: int) -> None:
         dimensions = {
             "row_count": row_count,
             "layer_count": layer_count,
@@ -841,9 +846,7 @@ class TieredGlmRouteController:
         if not isinstance(topk_weights, torch.Tensor):
             raise TypeError("Tiered GLM replay weights must be a tensor")
         if topk_ids.shape != expected_shape:
-            raise ValueError(
-                f"Tiered GLM replay IDs must have shape {expected_shape}"
-            )
+            raise ValueError(f"Tiered GLM replay IDs must have shape {expected_shape}")
         if topk_weights.shape != expected_shape:
             raise ValueError(
                 f"Tiered GLM replay weights must have shape {expected_shape}"
@@ -1391,8 +1394,7 @@ class EagerSelectedExpertsGlmTensorProvider:
                         self._fallback_unit_loads += tensor_count
                     self._loads += tensor_count
                     self._read_bytes += sum(
-                        self._tensor_byte_size(tensor)
-                        for tensor in tensors or []
+                        self._tensor_byte_size(tensor) for tensor in tensors or []
                     )
         if tensors is None:
             raise RuntimeError("Tiered GLM materialization did not produce tensors")
@@ -1483,13 +1485,22 @@ class EagerSelectedExpertsGlmTensorProvider:
 class DeviceWeightRuntimeGlmTensorProvider:
     """Adapt the model-agnostic runtime to the GLM routed-expert API."""
 
-    _DEVICE_CACHE_POLICIES = frozenset(("lru", "causal-turn-frequency-slru"))
+    _DEVICE_CACHE_POLICIES = frozenset(
+        ("lru", "causal-turn-frequency-slru", "causal-weighted-last-n")
+    )
+    _CAUSAL_DEVICE_CACHE_POLICIES = frozenset(
+        ("causal-turn-frequency-slru", "causal-weighted-last-n")
+    )
     _STABLE_WINDOW = 3
     _STABLE_MIN_PRIOR_DEMAND = 1
     _PROTECTED_FRACTION = 0.44
     _TURN_FREQUENCY_THRESHOLD = 3
     _TURN_FREQUENCY_WEIGHT = 2.0
     _STABLE_PRIORITY_BONUS = 8.0
+    _WARM_TURN_CAUSAL_CACHE_BUDGET_BYTES = 1_073_741_824
+    _WARM_TURN_CAUSAL_CACHE_SOURCE = "previous_completed_turn"
+    _WEIGHTED_LAST_N_DECAY = 0.5
+    _WEIGHTED_LAST_N_SOURCE = "completed_prior_turns"
 
     def __init__(
         self,
@@ -1509,7 +1520,10 @@ class DeviceWeightRuntimeGlmTensorProvider:
         device_cache_policy: str = "lru",
         layer_quota_groups: int | None = None,
         layer_quota_bytes: int | None = None,
+        enable_warm_turn_causal_cache: bool = False,
         dequant_cache_budget_bytes: int | None = None,
+        enable_current_layer_chunked_overlap: bool = False,
+        current_layer_chunk_in_flight_bytes: int | None = None,
         apply_timings: TieredGlmApplyTimings | None = None,
     ) -> None:
         if type(prefetch_depth) is not int or not 1 <= prefetch_depth <= 4:
@@ -1522,7 +1536,8 @@ class DeviceWeightRuntimeGlmTensorProvider:
             )
         if device_cache_policy not in self._DEVICE_CACHE_POLICIES:
             raise ValueError(
-                "device_cache_policy must be 'lru' or 'causal-turn-frequency-slru'"
+                "device_cache_policy must be 'lru', 'causal-turn-frequency-slru', "
+                "or 'causal-weighted-last-n'"
             )
         if layer_quota_groups is not None and (
             type(layer_quota_groups) is not int or layer_quota_groups <= 0
@@ -1534,14 +1549,36 @@ class DeviceWeightRuntimeGlmTensorProvider:
             raise ValueError("layer_quota_bytes must be a positive integer or None")
         if (layer_quota_groups is None) != (layer_quota_bytes is None):
             raise ValueError("layer byte and group quotas must be provided together")
-        if device_cache_policy == "causal-turn-frequency-slru" and (
+        if device_cache_policy in self._CAUSAL_DEVICE_CACHE_POLICIES and (
             layer_quota_groups is None or layer_quota_bytes is None
         ):
             raise ValueError(
-                "causal-turn-frequency-slru requires layer byte and group quotas"
+                f"{device_cache_policy} requires layer byte and group quotas"
             )
         if device_cache_policy == "lru" and layer_quota_groups is not None:
             raise ValueError("layer quotas require causal-turn-frequency-slru")
+        if type(enable_warm_turn_causal_cache) is not bool:
+            raise ValueError("enable_warm_turn_causal_cache must be a boolean")
+        if (
+            enable_warm_turn_causal_cache
+            and device_cache_policy == "causal-weighted-last-n"
+        ):
+            raise ValueError(
+                "enable_warm_turn_causal_cache is incompatible with "
+                "causal-weighted-last-n"
+            )
+        if enable_warm_turn_causal_cache:
+            if device_cache_budget_bytes != self._WARM_TURN_CAUSAL_CACHE_BUDGET_BYTES:
+                raise ValueError(
+                    "warm-turn causal cache requires the unchanged "
+                    "1,073,741,824-byte device-cache budget"
+                )
+            if device_cache_policy != "causal-turn-frequency-slru":
+                raise ValueError(
+                    "warm-turn causal cache requires causal-turn-frequency-slru"
+                )
+            if layer_quota_groups is None or layer_quota_bytes is None:
+                raise ValueError("warm-turn causal cache requires layer quotas")
         if dequant_cache_budget_bytes is not None and (
             type(dequant_cache_budget_bytes) is not int
             or dequant_cache_budget_bytes < 0
@@ -1549,12 +1586,37 @@ class DeviceWeightRuntimeGlmTensorProvider:
             raise ValueError(
                 "dequant_cache_budget_bytes must be a non-negative integer or None"
             )
+        if type(enable_current_layer_chunked_overlap) is not bool:
+            raise ValueError("enable_current_layer_chunked_overlap must be a boolean")
+        if current_layer_chunk_in_flight_bytes is not None and (
+            type(current_layer_chunk_in_flight_bytes) is not int
+            or current_layer_chunk_in_flight_bytes <= 0
+        ):
+            raise ValueError(
+                "current_layer_chunk_in_flight_bytes must be a positive integer or None"
+            )
+        if enable_current_layer_chunked_overlap:
+            if current_layer_chunk_in_flight_bytes is None:
+                raise ValueError(
+                    "current-layer chunked overlap requires a positive "
+                    "in-flight byte bound"
+                )
+            if enable_next_layer_prefetch:
+                raise ValueError(
+                    "current-layer chunked overlap cannot use next-layer prefetch"
+                )
+            if dequant_cache_budget_bytes is not None:
+                raise ValueError(
+                    "current-layer chunked overlap cannot use the dequant cache"
+                )
 
         self._runtime = runtime
         self._adapter = adapter
         self.execution_callback = execution_callback
         self.enable_prefetch = enable_prefetch
         self.enable_next_layer_prefetch = enable_next_layer_prefetch
+        self.enable_current_layer_chunked_overlap = enable_current_layer_chunked_overlap
+        self.current_layer_chunk_in_flight_bytes = current_layer_chunk_in_flight_bytes
         self.next_layer_prediction_provider = next_layer_prediction_provider
         self.prefetch_depth = prefetch_depth
         self._prefetch_stats_lock = threading.Lock()
@@ -1574,6 +1636,7 @@ class DeviceWeightRuntimeGlmTensorProvider:
         self._device_cache_policy = device_cache_policy
         self._layer_quota_groups = layer_quota_groups
         self._layer_quota_bytes = layer_quota_bytes
+        self.enable_warm_turn_causal_cache = enable_warm_turn_causal_cache
         self.apply_timings = apply_timings
         self._device_cache: OrderedDict[
             _GlmDeviceCacheKey,
@@ -1618,6 +1681,10 @@ class DeviceWeightRuntimeGlmTensorProvider:
             metric_prefix="dequant_cache",
         )
         self._dequant_cache_closed = False
+        self._current_layer_chunk_schedulers: dict[int, Any] = {}
+        self._current_layer_chunk_scheduler_lock = threading.RLock()
+        self._current_layer_projection_seconds = 0.0
+        self._current_layer_timing_lock = threading.Lock()
 
     @property
     def uses_derived_cache(self) -> bool:
@@ -1629,6 +1696,13 @@ class DeviceWeightRuntimeGlmTensorProvider:
     @contextmanager
     def warmup_without_derived_caches(self):
         """Run one warm-up without allocating derived-cache entries."""
+        clear_verified_payload_caches = getattr(
+            self._runtime,
+            "clear_verified_payload_caches",
+            None,
+        )
+        if callable(clear_verified_payload_caches):
+            clear_verified_payload_caches()
         with self._device_cache_lock:
             if self._device_cache_active_leases != 0 or self._device_cache:
                 if self._device_cache_active_leases != 0:
@@ -1662,6 +1736,8 @@ class DeviceWeightRuntimeGlmTensorProvider:
             self._device_cache_budget_bytes = device_cache_budget_bytes
             self._dequant_cache_budget_bytes = dequant_cache_budget_bytes
             self._dequant_cache._budget_bytes = dequant_cache_internal_budget_bytes
+            if callable(clear_verified_payload_caches):
+                clear_verified_payload_caches()
 
     def request_experts(self, demands: Sequence[Any]) -> TieredGlmResidentExperts:
         if not demands:
@@ -1793,6 +1869,196 @@ class DeviceWeightRuntimeGlmTensorProvider:
 
         return TieredGlmResidentExperts(experts, release)
 
+    def run_current_layer_expert_chunks(
+        self,
+        layer_id: int,
+        execution_chunks: Sequence[Sequence[int]],
+        callback: Callable[[int, TieredGlmExpertProjections, tuple[int, ...]], Any],
+    ) -> list[Any]:
+        if not self.enable_current_layer_chunked_overlap:
+            raise RuntimeError(
+                "current-layer chunked overlap is not enabled for this provider"
+            )
+        if type(layer_id) is not int:
+            raise TypeError("current-layer chunk layer ID must be an integer")
+        normalized_chunks = tuple(tuple(chunk) for chunk in execution_chunks)
+        if not normalized_chunks or any(not chunk for chunk in normalized_chunks):
+            raise ValueError("current-layer execution chunks must be non-empty")
+        if any(
+            any(type(expert_id) is not int for expert_id in chunk)
+            for chunk in normalized_chunks
+        ):
+            raise ValueError("current-layer execution chunks must contain integers")
+
+        scheduler = self._current_layer_chunk_scheduler(layer_id)
+        wait_seconds_before = scheduler.stats()["wait_seconds"]
+        with self._current_layer_timing_lock:
+            projection_seconds_before = self._current_layer_projection_seconds
+        chunk_index = 0
+        projection_ready_events = [threading.Event() for _ in normalized_chunks]
+        projection_ready_events[0].set()
+        projection_cancelled = threading.Event()
+        prepare_index = 0
+        prepare_index_lock = threading.Lock()
+
+        if self._device_cache_budget_bytes is None:
+            prepare = None
+        else:
+
+            def prepare(expert_ids: Sequence[int]):
+                nonlocal prepare_index
+                with prepare_index_lock:
+                    current_prepare_index = prepare_index
+                    prepare_index += 1
+                if current_prepare_index != 0:
+                    projection_ready_events[current_prepare_index].wait()
+                if projection_cancelled.is_set():
+                    raise RuntimeError("current-layer chunk preparation was cancelled")
+                return self._prepare_current_layer_chunk(layer_id, expert_ids)
+
+        def projection(
+            lease_set: Any,
+            context: _CurrentLayerChunkCacheContext | None = None,
+        ) -> TieredGlmExpertProjections:
+            started = time.perf_counter()
+            try:
+                if context is None:
+                    return self._build_experts(tuple(lease_set))
+                return self._combine_current_layer_chunk_projections(
+                    tuple(lease_set),
+                    context,
+                )
+            except BaseException:
+                projection_cancelled.set()
+                for projection_ready_event in projection_ready_events:
+                    projection_ready_event.set()
+                raise
+            finally:
+                elapsed_seconds = time.perf_counter() - started
+                if chunk_index + 1 < len(projection_ready_events):
+                    projection_ready_events[chunk_index + 1].set()
+                with self._current_layer_timing_lock:
+                    self._current_layer_projection_seconds += elapsed_seconds
+
+        def scheduled_callback(experts: TieredGlmExpertProjections) -> Any:
+            nonlocal chunk_index
+            current_index = chunk_index
+            chunk_index += 1
+            return callback(current_index, experts, normalized_chunks[current_index])
+
+        results = scheduler.run(
+            normalized_chunks,
+            scheduled_callback,
+            projection=projection,
+            prepare=prepare,
+            release=self._release_current_layer_chunk_cache_context,
+        )
+        wait_seconds = scheduler.stats()["wait_seconds"] - wait_seconds_before
+        if self.apply_timings is not None:
+            with self._current_layer_timing_lock:
+                projection_seconds = (
+                    self._current_layer_projection_seconds - projection_seconds_before
+                )
+            self.apply_timings.record(
+                "provider_request",
+                wait_seconds + projection_seconds,
+            )
+        return results
+
+    def _prepare_current_layer_chunk(
+        self,
+        layer_id: int,
+        expert_ids: Sequence[int],
+    ) -> DeviceWeightCurrentLayerChunkPreparation:
+        cached_projections: dict[int, dict[str, TieredGlmProjection]] = {}
+        projection_names: dict[int, tuple[str, ...]] = {}
+        uncached_expert_ids: list[int] = []
+        cache_keys: list[tuple[int, int, str]] = []
+        try:
+            for expert_id in sorted(expert_ids):
+                self._record_device_cache_policy_access((layer_id, expert_id))
+                names = self._expert_projection_names(
+                    expert_id,
+                    layer_id=layer_id,
+                )
+                projection_names[expert_id] = names
+                projections: dict[str, TieredGlmProjection] = {}
+                for projection_name in names:
+                    cache_key = (layer_id, expert_id, projection_name)
+                    cached_projection = self._acquire_cached_projection(cache_key)
+                    if cached_projection is not None:
+                        cache_keys.append(cache_key)
+                        projections[projection_name] = cached_projection
+                cached_projections[expert_id] = projections
+                if len(projections) != len(names):
+                    uncached_expert_ids.append(expert_id)
+        except BaseException:
+            for cache_key in reversed(cache_keys):
+                self._release_cached_projection(cache_key)
+            raise
+
+        context = _CurrentLayerChunkCacheContext(
+            layer_id=layer_id,
+            cached_projections=cached_projections,
+            projection_names=projection_names,
+            uncached_expert_ids=tuple(uncached_expert_ids),
+            cache_keys=cache_keys,
+        )
+        return DeviceWeightCurrentLayerChunkPreparation(
+            uncached_expert_ids=context.uncached_expert_ids,
+            context=context,
+        )
+
+    def _combine_current_layer_chunk_projections(
+        self,
+        lease_set: Any,
+        context: _CurrentLayerChunkCacheContext,
+    ) -> TieredGlmExpertProjections:
+        leased_projections = self._build_experts(tuple(lease_set))
+        experts: TieredGlmExpertProjections = {}
+        for expert_id, projection_names in context.projection_names.items():
+            projections = dict(context.cached_projections[expert_id])
+            for projection_name in projection_names:
+                if projection_name in projections:
+                    continue
+                projection = leased_projections[expert_id][projection_name]
+                cache_key = (context.layer_id, expert_id, projection_name)
+                cached_projection = self._cache_projection(cache_key, projection)
+                if cached_projection is not None:
+                    context.cache_keys.append(cache_key)
+                    projection = cached_projection
+                projections[projection_name] = projection
+            experts[expert_id] = projections
+        return experts
+
+    def _release_current_layer_chunk_cache_context(
+        self,
+        context: _CurrentLayerChunkCacheContext,
+    ) -> None:
+        for cache_key in reversed(context.cache_keys):
+            self._release_cached_projection(cache_key)
+
+    def _current_layer_chunk_scheduler(self, layer_id: int) -> Any:
+        with self._current_layer_chunk_scheduler_lock:
+            scheduler = self._current_layer_chunk_schedulers.get(layer_id)
+            if scheduler is None:
+                scheduler = DeviceWeightCurrentLayerChunkScheduler(
+                    self._runtime,
+                    layer_id=layer_id,
+                    max_in_flight_bytes=self.current_layer_chunk_in_flight_bytes,
+                )
+                self._current_layer_chunk_schedulers[layer_id] = scheduler
+            return scheduler
+
+    def _close_current_layer_chunk_schedulers(self) -> None:
+        with self._current_layer_chunk_scheduler_lock:
+            schedulers = tuple(self._current_layer_chunk_schedulers.items())
+        for layer_id, scheduler in schedulers:
+            scheduler.close()
+            with self._current_layer_chunk_scheduler_lock:
+                if self._current_layer_chunk_schedulers.get(layer_id) is scheduler:
+                    del self._current_layer_chunk_schedulers[layer_id]
+
     def prefetch_experts(self, demands: Sequence[Any]) -> None:
         if not self.enable_prefetch:
             return
@@ -1831,6 +2097,9 @@ class DeviceWeightRuntimeGlmTensorProvider:
         if not callable(begin_runtime_pass):
             raise ValueError("Tiered GLM runtime does not support runtime passes")
         begin_runtime_pass()
+        if self.enable_warm_turn_causal_cache:
+            with self._device_cache_lock:
+                self._refresh_warm_turn_causal_selection_locked()
 
     def begin_sequence_turn(self) -> None:
         begin_sequence_turn = getattr(
@@ -1841,7 +2110,7 @@ class DeviceWeightRuntimeGlmTensorProvider:
         if not callable(begin_sequence_turn):
             raise ValueError("Tiered GLM runtime does not support sequence turns")
         begin_sequence_turn()
-        if self._device_cache_policy != "causal-turn-frequency-slru":
+        if self._device_cache_policy not in self._CAUSAL_DEVICE_CACHE_POLICIES:
             return
 
         with self._device_cache_lock:
@@ -1853,13 +2122,18 @@ class DeviceWeightRuntimeGlmTensorProvider:
                 self._sequence_turn_index += 1
             self._current_turn_groups.clear()
             self._current_turn_demand_counts.clear()
-            self._stable_pinned_groups = self._select_stable_groups_locked()
-            self._causal_pinned_groups = set(self._stable_pinned_groups)
-            self._protected_groups = {
-                group_key
-                for group_key in self._stable_pinned_groups
-                if group_key in self._device_cache_groups
-            }
+            if self._device_cache_policy == "causal-weighted-last-n":
+                self._refresh_weighted_last_n_selection_locked()
+            elif self.enable_warm_turn_causal_cache:
+                self._refresh_warm_turn_causal_selection_locked()
+            else:
+                self._stable_pinned_groups = self._select_stable_groups_locked()
+                self._causal_pinned_groups = set(self._stable_pinned_groups)
+                self._protected_groups = {
+                    group_key
+                    for group_key in self._stable_pinned_groups
+                    if group_key in self._device_cache_groups
+                }
 
     def prefetch_next_layer_experts(
         self,
@@ -2021,6 +2295,7 @@ class DeviceWeightRuntimeGlmTensorProvider:
                     return
 
     def close_prefetches(self, *, wait: bool = True) -> None:
+        self._close_current_layer_chunk_schedulers()
         close_prefetches = getattr(self._runtime, "close_prefetches", None)
         if callable(close_prefetches):
             close_prefetches(wait=wait)
@@ -2046,6 +2321,7 @@ class DeviceWeightRuntimeGlmTensorProvider:
                     f"{self._device_cache_active_leases}"
                 )
 
+        self._close_current_layer_chunk_schedulers()
         self.drain_prefetches()
         self.close_prefetches(wait=True)
         with self._device_cache_lock:
@@ -2057,6 +2333,11 @@ class DeviceWeightRuntimeGlmTensorProvider:
             while self._device_cache:
                 cache_key = next(iter(self._device_cache))
                 self._remove_cached_projection(cache_key)
+            if (
+                self._device_cache_policy == "causal-weighted-last-n"
+                or self.enable_warm_turn_causal_cache
+            ):
+                self._reset_turn_causal_history_locked()
 
         runtime_clear = getattr(self._runtime, "clear", None)
         if callable(runtime_clear):
@@ -2113,7 +2394,81 @@ class DeviceWeightRuntimeGlmTensorProvider:
             stats["device_cache_pinned_groups"] = len(self._causal_pinned_groups)
             stats["device_cache_protected_groups"] = len(self._protected_groups)
             stats["device_cache_sequence_turns"] = self._sequence_turn_index
+            stats["device_cache_history_turns"] = (
+                len(self._previous_turn_groups)
+                if self._device_cache_policy == "causal-weighted-last-n"
+                else 0
+            )
+            stats["device_cache_selected_groups"] = (
+                len(self._causal_pinned_groups)
+                if self._device_cache_policy == "causal-weighted-last-n"
+                else 0
+            )
+            stats["device_cache_selection_source"] = (
+                self._WEIGHTED_LAST_N_SOURCE
+                if self._device_cache_policy == "causal-weighted-last-n"
+                else None
+            )
+            stats["warm_turn_causal_cache_enabled"] = self.enable_warm_turn_causal_cache
+            stats["warm_turn_causal_cache_prior_turn_pin_count"] = len(
+                self._causal_pinned_groups
+            )
+            stats["warm_turn_causal_cache_protected_groups"] = len(
+                self._protected_groups
+            )
+            stats["warm_turn_causal_cache_protected_bytes"] = sum(
+                self._device_cache_group_bytes.get(group_key, 0)
+                for group_key in self._protected_groups
+            )
+            stats["warm_turn_causal_cache_source"] = (
+                self._WARM_TURN_CAUSAL_CACHE_SOURCE
+                if self.enable_warm_turn_causal_cache
+                else None
+            )
         stats.update(self._dequant_cache.stats())
+        with self._current_layer_chunk_scheduler_lock:
+            schedulers = tuple(self._current_layer_chunk_schedulers.values())
+        scheduler_stats = [scheduler.stats() for scheduler in schedulers]
+        stats["current_layer_chunked_overlap_enabled"] = (
+            self.enable_current_layer_chunked_overlap
+        )
+        stats["current_layer_chunk_in_flight_bytes"] = (
+            self.current_layer_chunk_in_flight_bytes
+        )
+        stats["current_layer_chunk_scheduler_layers"] = len(schedulers)
+        stats["current_layer_chunk_planned_groups"] = sum(
+            scheduler_stats["planned_groups"] for scheduler_stats in scheduler_stats
+        )
+        stats["current_layer_chunk_execution_chunks"] = sum(
+            scheduler_stats["execution_chunks"] for scheduler_stats in scheduler_stats
+        )
+        stats["current_layer_chunk_read_chunks"] = sum(
+            scheduler_stats["read_chunks"] for scheduler_stats in scheduler_stats
+        )
+        stats["current_layer_chunk_useful_read_chunks"] = sum(
+            scheduler_stats["useful_read_chunks"] for scheduler_stats in scheduler_stats
+        )
+        stats["current_layer_chunk_stalled_read_chunks"] = sum(
+            scheduler_stats["stalled_read_chunks"]
+            for scheduler_stats in scheduler_stats
+        )
+        stats["current_layer_chunk_overlap_seconds"] = sum(
+            scheduler_stats["overlap_seconds"] for scheduler_stats in scheduler_stats
+        )
+        stats["current_layer_chunk_wait_seconds"] = sum(
+            scheduler_stats["wait_seconds"] for scheduler_stats in scheduler_stats
+        )
+        stats["current_layer_chunk_in_flight_current_bytes"] = sum(
+            scheduler_stats["in_flight_bytes"] for scheduler_stats in scheduler_stats
+        )
+        stats["current_layer_chunk_reserved_device_bytes"] = sum(
+            scheduler_stats["reserved_device_bytes"]
+            for scheduler_stats in scheduler_stats
+        )
+        with self._current_layer_timing_lock:
+            stats["current_layer_projection_seconds"] = (
+                self._current_layer_projection_seconds
+            )
         return stats
 
     def _expert_projection_names(
@@ -2140,13 +2495,18 @@ class DeviceWeightRuntimeGlmTensorProvider:
         self,
         group_key: _GlmDeviceCacheGroupKey,
     ) -> None:
-        if self._device_cache_policy != "causal-turn-frequency-slru":
+        if self._device_cache_policy not in self._CAUSAL_DEVICE_CACHE_POLICIES:
             return
 
         with self._device_cache_lock:
             self._current_turn_groups.add(group_key)
             demand_count = self._current_turn_demand_counts.get(group_key, 0) + 1
             self._current_turn_demand_counts[group_key] = demand_count
+            if (
+                self.enable_warm_turn_causal_cache
+                or self._device_cache_policy == "causal-weighted-last-n"
+            ):
+                return
             if demand_count < self._TURN_FREQUENCY_THRESHOLD:
                 return
 
@@ -2224,6 +2584,63 @@ class DeviceWeightRuntimeGlmTensorProvider:
             selected_layer_groups[layer_id] = selected_layer_groups.get(layer_id, 0) + 1
         return selected_groups
 
+    def _refresh_warm_turn_causal_selection_locked(self) -> None:
+        if not self._previous_turn_groups:
+            self._stable_pinned_groups.clear()
+            self._causal_pinned_groups.clear()
+            self._protected_groups.clear()
+            return
+
+        prior_groups = self._previous_turn_groups[-1]
+        prior_demand_counts = self._previous_turn_demand_counts[-1]
+        selected_groups = self._select_quoted_groups_locked(
+            set(prior_groups),
+            lambda group_key: (
+                -prior_demand_counts.get(group_key, 0),
+                group_key,
+            ),
+        )
+        self._stable_pinned_groups.clear()
+        self._causal_pinned_groups = selected_groups
+        self._protected_groups = {
+            group_key
+            for group_key in selected_groups
+            if group_key in self._device_cache_groups
+        }
+
+    def _refresh_weighted_last_n_selection_locked(self) -> None:
+        scores: dict[_GlmDeviceCacheGroupKey, float] = {}
+        for turn_age, turn_counts in enumerate(
+            reversed(self._previous_turn_demand_counts)
+        ):
+            turn_weight = self._WEIGHTED_LAST_N_DECAY**turn_age
+            for group_key, demand_count in turn_counts.items():
+                scores[group_key] = (
+                    scores.get(group_key, 0.0) + turn_weight * demand_count
+                )
+
+        selected_groups = self._select_quoted_groups_locked(
+            set(scores),
+            lambda group_key: (-scores.get(group_key, 0.0), group_key),
+        )
+        self._stable_pinned_groups.clear()
+        self._causal_pinned_groups = selected_groups
+        self._protected_groups = {
+            group_key
+            for group_key in selected_groups
+            if group_key in self._device_cache_groups
+        }
+
+    def _reset_turn_causal_history_locked(self) -> None:
+        self._current_turn_groups.clear()
+        self._current_turn_demand_counts.clear()
+        self._previous_turn_groups.clear()
+        self._previous_turn_demand_counts.clear()
+        self._stable_pinned_groups.clear()
+        self._causal_pinned_groups.clear()
+        self._protected_groups.clear()
+        self._sequence_turn_index = 0
+
     def _device_cache_group_size_locked(
         self,
         group_key: _GlmDeviceCacheGroupKey,
@@ -2280,6 +2697,12 @@ class DeviceWeightRuntimeGlmTensorProvider:
             for group_key in nonpinned_candidates
             if group_key not in self._protected_groups
         ]
+        if (
+            self._device_cache_policy == "causal-weighted-last-n"
+            and not probation_candidates
+            and not nonpinned_candidates
+        ):
+            return None
         return (probation_candidates or nonpinned_candidates or group_candidates)[0]
 
     def _prepare_device_cache_group_locked(
@@ -2323,7 +2746,9 @@ class DeviceWeightRuntimeGlmTensorProvider:
                     and current_group_key != group_key
                 )
             if victim_group is None and not exceeds_global_budget:
-                return True
+                if self._device_cache_policy == "causal-weighted-last-n":
+                    return False
+                return not (self.enable_warm_turn_causal_cache and exceeds_layer_quota)
             if victim_group is None:
                 victim_group = self._select_group_victim_locked(
                     current_group_key
@@ -2363,6 +2788,7 @@ class DeviceWeightRuntimeGlmTensorProvider:
             self._device_cache_hits += 1
             if (
                 self._device_cache_policy == "causal-turn-frequency-slru"
+                and not self.enable_warm_turn_causal_cache
                 and group_key not in self._causal_pinned_groups
                 and group_key not in self._protected_groups
                 and len(self._protected_groups) < self._protected_group_target
@@ -2410,7 +2836,7 @@ class DeviceWeightRuntimeGlmTensorProvider:
                 return None
 
             group_key = cache_key[:2]
-            if self._device_cache_policy == "causal-turn-frequency-slru":
+            if self._device_cache_policy in self._CAUSAL_DEVICE_CACHE_POLICIES:
                 if not self._prepare_device_cache_group_locked(group_key):
                     del cached_projection
                     scratch_reservation.close()
@@ -2640,12 +3066,29 @@ class TieredGlm53MoEMethod(FusedMoEMethodBase):
             if experts_per_token <= 0:
                 raise ValueError("Tiered GLM routing selected no experts")
             max_expert_union = self._provider_max_expert_union(experts_per_token)
+            run_current_layer_chunks = getattr(
+                self._provider,
+                "run_current_layer_expert_chunks",
+                None,
+            )
+            current_layer_chunked_overlap = getattr(
+                self._provider,
+                "enable_current_layer_chunked_overlap",
+                False,
+            ) and callable(run_current_layer_chunks)
 
             next_layer_prefetch_fired = False
             prefetch_experts = getattr(self._provider, "prefetch_experts", None)
-            if getattr(self._provider, "enable_prefetch", False) and callable(
-                prefetch_experts
-            ) and not getattr(self._provider, "uses_derived_cache", False):
+            if (
+                getattr(self._provider, "enable_prefetch", False)
+                and callable(prefetch_experts)
+                and not current_layer_chunked_overlap
+                and not getattr(
+                    self._provider,
+                    "uses_derived_cache",
+                    False,
+                )
+            ):
                 try:
                     with _timed_glm_apply_stage(
                         apply_timings, "demand_build", x.device
@@ -2683,6 +3126,60 @@ class TieredGlm53MoEMethod(FusedMoEMethodBase):
                         experts_per_token,
                         max_expert_union,
                     )
+                if current_layer_chunked_overlap:
+                    layer_id = _parse_glm_layer_id(layer.layer_name)
+                    execution_chunks = _expert_unions_for_row_partitions(
+                        topk_ids,
+                        row_partitions,
+                    )
+
+                    def execute_chunk(
+                        chunk_index: int,
+                        experts: TieredGlmExpertProjections,
+                        _expert_ids: tuple[int, ...],
+                    ) -> None:
+                        row_indices = row_partitions[chunk_index]
+                        scratch_bytes = _glm_53_execution_scratch_bytes(
+                            x[row_indices],
+                            experts,
+                            include_output=False,
+                        )
+                        if callable(reserve_execution_scratch):
+                            scratch_reservation = reserve_execution_scratch(
+                                scratch_bytes
+                            )
+                        else:
+                            scratch_reservation = nullcontext()
+                        with scratch_reservation:
+                            with _timed_glm_apply_stage(
+                                apply_timings, "callback", x.device
+                            ):
+                                chunk_output = self._execution_callback(
+                                    x[row_indices],
+                                    topk_weights[row_indices],
+                                    topk_ids[row_indices],
+                                    experts,
+                                )
+                            with _timed_glm_apply_stage(
+                                apply_timings, "output_copy", x.device
+                            ):
+                                output.index_copy_(
+                                    0,
+                                    torch.as_tensor(
+                                        row_indices,
+                                        device=x.device,
+                                        dtype=torch.long,
+                                    ),
+                                    chunk_output,
+                                )
+
+                    run_current_layer_chunks(
+                        layer_id,
+                        execution_chunks,
+                        execute_chunk,
+                    )
+                    return output
+
                 for row_indices in row_partitions:
                     with _timed_glm_apply_stage(
                         apply_timings, "demand_build", x.device
@@ -2987,6 +3484,25 @@ def _partition_rows_by_expert_union(
     return row_groups
 
 
+def _expert_unions_for_row_partitions(
+    topk_ids: torch.Tensor,
+    row_partitions: Sequence[Sequence[int]],
+) -> tuple[tuple[int, ...], ...]:
+    if topk_ids.ndim != 2:
+        raise ValueError("Tiered GLM routing IDs must be rank 2")
+    execution_chunks: list[tuple[int, ...]] = []
+    for row_indices in row_partitions:
+        expert_ids = {
+            int(expert_id)
+            for row in topk_ids[row_indices].tolist()
+            for expert_id in row
+        }
+        if not expert_ids:
+            raise ValueError("Tiered GLM row partition selected no experts")
+        execution_chunks.append(tuple(sorted(expert_ids)))
+    return tuple(execution_chunks)
+
+
 def _glm_53_execution_scratch_bytes(
     hidden_states: torch.Tensor,
     experts: dict[int, dict[str, TieredGlmProjection]],
@@ -3010,9 +3526,7 @@ def _glm_53_execution_scratch_bytes(
         4 * num_tokens * (5 * hidden_size + 3 * intermediate_size),
         padded_activation_bytes,
     )
-    callback_reservation_bytes = (
-        callback_activation_bytes + 16 * weight_elements
-    )
+    callback_reservation_bytes = callback_activation_bytes + 16 * weight_elements
     matmul_peak_bytes = (
         20 * num_tokens * hidden_size
         + 16 * num_tokens * intermediate_size
@@ -3075,10 +3589,9 @@ def _dequant_glm_53_fp8_block(projection: TieredGlmProjection) -> torch.Tensor:
                 block_columns,
             )
         )
-        return (
-            blocked_weight.to(torch.float32)
-            * scale[:, None, :, None]
-        ).view(weight.shape)
+        return (blocked_weight.to(torch.float32) * scale[:, None, :, None]).view(
+            weight.shape
+        )
 
     expanded_scale = scale.repeat_interleave(block_rows, dim=0).repeat_interleave(
         block_columns, dim=1
