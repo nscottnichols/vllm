@@ -3095,7 +3095,7 @@ def test_glm_single_provider_warmup_disables_and_restores_derived_caches():
         dequant_cache_budget_bytes=72,
     )
     clear_verified_payload_cache_calls = []
-    runtime.clear_verified_payload_caches = lambda: (
+    runtime.clear_derived_payload_caches = lambda: (
         clear_verified_payload_cache_calls.append(True)
     )
     method = TieredGlm53MoEMethod(SimpleNamespace(), provider=provider)

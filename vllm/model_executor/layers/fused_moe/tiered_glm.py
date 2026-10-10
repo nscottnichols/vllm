@@ -1696,13 +1696,13 @@ class DeviceWeightRuntimeGlmTensorProvider:
     @contextmanager
     def warmup_without_derived_caches(self):
         """Run one warm-up without allocating derived-cache entries."""
-        clear_verified_payload_caches = getattr(
+        clear_derived_payload_caches = getattr(
             self._runtime,
-            "clear_verified_payload_caches",
+            "clear_derived_payload_caches",
             None,
         )
-        if callable(clear_verified_payload_caches):
-            clear_verified_payload_caches()
+        if callable(clear_derived_payload_caches):
+            clear_derived_payload_caches()
         with self._device_cache_lock:
             if self._device_cache_active_leases != 0 or self._device_cache:
                 if self._device_cache_active_leases != 0:
@@ -1736,8 +1736,8 @@ class DeviceWeightRuntimeGlmTensorProvider:
             self._device_cache_budget_bytes = device_cache_budget_bytes
             self._dequant_cache_budget_bytes = dequant_cache_budget_bytes
             self._dequant_cache._budget_bytes = dequant_cache_internal_budget_bytes
-            if callable(clear_verified_payload_caches):
-                clear_verified_payload_caches()
+            if callable(clear_derived_payload_caches):
+                clear_derived_payload_caches()
 
     def request_experts(self, demands: Sequence[Any]) -> TieredGlmResidentExperts:
         if not demands:
