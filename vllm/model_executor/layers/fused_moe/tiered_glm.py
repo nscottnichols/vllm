@@ -2699,11 +2699,11 @@ class DeviceWeightRuntimeGlmTensorProvider:
                         0,
                         prior_group_bytes - admitted_group_bytes,
                     ),
-                    "unprotected_group_count": max(
+                    "admitted_but_unprotected_group_count": max(
                         0,
                         admitted_group_count - protected_group_count,
                     ),
-                    "unprotected_group_bytes": max(
+                    "admitted_but_unprotected_group_bytes": max(
                         0,
                         admitted_group_bytes - protected_group_bytes,
                     ),
@@ -2729,11 +2729,13 @@ class DeviceWeightRuntimeGlmTensorProvider:
             "quota_rejection_bytes": sum(
                 record["quota_rejected_group_bytes"] for record in per_layer
             ),
-            "unprotected_group_count": sum(
-                record["unprotected_group_count"] for record in per_layer
+            "admitted_but_unprotected_count": sum(
+                record["admitted_but_unprotected_group_count"]
+                for record in per_layer
             ),
-            "unprotected_group_bytes": sum(
-                record["unprotected_group_bytes"] for record in per_layer
+            "admitted_but_unprotected_bytes": sum(
+                record["admitted_but_unprotected_group_bytes"]
+                for record in per_layer
             ),
             "quota_group_saturation_layer_count": sum(
                 record["quota_group_saturation"] for record in per_layer
