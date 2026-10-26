@@ -1685,6 +1685,11 @@ class DeviceWeightRuntimeGlmTensorProvider:
         self._current_layer_chunk_scheduler_lock = threading.RLock()
         self._current_layer_projection_seconds = 0.0
         self._current_layer_timing_lock = threading.Lock()
+        self._warm_turn_causal_cache_refresh_count = 0
+        self._warm_turn_causal_cache_admission_seconds = 0.0
+        self._warm_turn_causal_cache_protection_seconds = 0.0
+        self._warm_turn_causal_cache_last_admission_seconds = 0.0
+        self._warm_turn_causal_cache_last_protection_seconds = 0.0
 
     @property
     def uses_derived_cache(self) -> bool:
@@ -2425,6 +2430,9 @@ class DeviceWeightRuntimeGlmTensorProvider:
                 if self.enable_warm_turn_causal_cache
                 else None
             )
+            stats["warm_turn_causal_cache"] = (
+                self._warm_turn_causal_cache_telemetry_locked()
+            )
         stats.update(self._dequant_cache.stats())
         with self._current_layer_chunk_scheduler_lock:
             schedulers = tuple(self._current_layer_chunk_schedulers.values())
@@ -2591,6 +2599,7 @@ class DeviceWeightRuntimeGlmTensorProvider:
             self._protected_groups.clear()
             return
 
+        admission_started = time.perf_counter()
         prior_groups = self._previous_turn_groups[-1]
         prior_demand_counts = self._previous_turn_demand_counts[-1]
         selected_groups = self._select_quoted_groups_locked(
@@ -2600,12 +2609,151 @@ class DeviceWeightRuntimeGlmTensorProvider:
                 group_key,
             ),
         )
+        admission_seconds = time.perf_counter() - admission_started
+        self._warm_turn_causal_cache_admission_seconds += admission_seconds
+        self._warm_turn_causal_cache_last_admission_seconds = admission_seconds
+        protection_started = time.perf_counter()
         self._stable_pinned_groups.clear()
         self._causal_pinned_groups = selected_groups
         self._protected_groups = {
             group_key
             for group_key in selected_groups
             if group_key in self._device_cache_groups
+        }
+        protection_seconds = time.perf_counter() - protection_started
+        self._warm_turn_causal_cache_protection_seconds += protection_seconds
+        self._warm_turn_causal_cache_last_protection_seconds = protection_seconds
+        self._warm_turn_causal_cache_refresh_count += 1
+
+    def _warm_turn_causal_cache_telemetry_locked(self) -> dict[str, Any] | None:
+        if not self.enable_warm_turn_causal_cache:
+            return None
+
+        prior_groups = (
+            set(self._previous_turn_groups[-1])
+            if self._previous_turn_groups
+            else set()
+        )
+        prior_counts = (
+            dict(self._previous_turn_demand_counts[-1])
+            if self._previous_turn_demand_counts
+            else {}
+        )
+        ordered_groups = sorted(
+            prior_groups,
+            key=lambda group_key: (-prior_counts.get(group_key, 0), group_key),
+        )
+        layers: dict[int, list[_GlmDeviceCacheGroupKey]] = {}
+        for group_key in ordered_groups:
+            layers.setdefault(group_key[0], []).append(group_key)
+
+        per_layer: list[dict[str, Any]] = []
+        for layer_id, layer_groups in sorted(layers.items()):
+            admitted_expert_ids = [
+                expert_id
+                for _layer_id, expert_id in layer_groups
+                if (_layer_id, expert_id) in self._causal_pinned_groups
+            ]
+            protected_expert_ids = [
+                expert_id
+                for _layer_id, expert_id in layer_groups
+                if (_layer_id, expert_id) in self._protected_groups
+            ]
+            prior_group_count = len(layer_groups)
+            prior_group_bytes = sum(
+                self._device_cache_group_size_locked(group_key)
+                for group_key in layer_groups
+            )
+            admitted_group_count = len(admitted_expert_ids)
+            admitted_group_bytes = sum(
+                self._device_cache_group_size_locked((layer_id, expert_id))
+                for expert_id in admitted_expert_ids
+            )
+            protected_group_count = len(protected_expert_ids)
+            protected_group_bytes = sum(
+                self._device_cache_group_bytes.get((layer_id, expert_id), 0)
+                for expert_id in protected_expert_ids
+            )
+            quota_group_limit = self._layer_quota_groups or 0
+            quota_byte_limit = self._layer_quota_bytes or 0
+            per_layer.append(
+                {
+                    "layer_id": layer_id,
+                    "prior_turn_group_count": prior_group_count,
+                    "prior_turn_group_bytes": prior_group_bytes,
+                    "admitted_group_count": admitted_group_count,
+                    "admitted_group_bytes": admitted_group_bytes,
+                    "admitted_expert_ids": admitted_expert_ids,
+                    "protected_group_count": protected_group_count,
+                    "protected_group_bytes": protected_group_bytes,
+                    "protected_expert_ids": protected_expert_ids,
+                    "quota_group_limit": quota_group_limit,
+                    "quota_byte_limit": quota_byte_limit,
+                    "quota_group_saturation": admitted_group_count >= quota_group_limit,
+                    "quota_byte_saturation": admitted_group_bytes >= quota_byte_limit,
+                    "quota_rejected_group_count": max(
+                        0,
+                        prior_group_count - admitted_group_count,
+                    ),
+                    "quota_rejected_group_bytes": max(
+                        0,
+                        prior_group_bytes - admitted_group_bytes,
+                    ),
+                    "unprotected_group_count": max(
+                        0,
+                        admitted_group_count - protected_group_count,
+                    ),
+                    "unprotected_group_bytes": max(
+                        0,
+                        admitted_group_bytes - protected_group_bytes,
+                    ),
+                },
+            )
+
+        admission_count = sum(record["admitted_group_count"] for record in per_layer)
+        admission_bytes = sum(record["admitted_group_bytes"] for record in per_layer)
+        protection_count = sum(record["protected_group_count"] for record in per_layer)
+        protection_bytes = sum(record["protected_group_bytes"] for record in per_layer)
+        return {
+            "source": self._WARM_TURN_CAUSAL_CACHE_SOURCE,
+            "ranking": "prior-turn demand descending, expert id ascending",
+            "layer_count": len(per_layer),
+            "per_layer": per_layer,
+            "admission_count": admission_count,
+            "admission_bytes": admission_bytes,
+            "protection_count": protection_count,
+            "protection_bytes": protection_bytes,
+            "quota_rejection_count": sum(
+                record["quota_rejected_group_count"] for record in per_layer
+            ),
+            "quota_rejection_bytes": sum(
+                record["quota_rejected_group_bytes"] for record in per_layer
+            ),
+            "unprotected_group_count": sum(
+                record["unprotected_group_count"] for record in per_layer
+            ),
+            "unprotected_group_bytes": sum(
+                record["unprotected_group_bytes"] for record in per_layer
+            ),
+            "quota_group_saturation_layer_count": sum(
+                record["quota_group_saturation"] for record in per_layer
+            ),
+            "quota_byte_saturation_layer_count": sum(
+                record["quota_byte_saturation"] for record in per_layer
+            ),
+            "cumulative_refresh_count": self._warm_turn_causal_cache_refresh_count,
+            "cumulative_admission_seconds": (
+                self._warm_turn_causal_cache_admission_seconds
+            ),
+            "cumulative_protection_seconds": (
+                self._warm_turn_causal_cache_protection_seconds
+            ),
+            "last_admission_seconds": (
+                self._warm_turn_causal_cache_last_admission_seconds
+            ),
+            "last_protection_seconds": (
+                self._warm_turn_causal_cache_last_protection_seconds
+            ),
         }
 
     def _refresh_weighted_last_n_selection_locked(self) -> None:
@@ -2640,6 +2788,11 @@ class DeviceWeightRuntimeGlmTensorProvider:
         self._causal_pinned_groups.clear()
         self._protected_groups.clear()
         self._sequence_turn_index = 0
+        self._warm_turn_causal_cache_refresh_count = 0
+        self._warm_turn_causal_cache_admission_seconds = 0.0
+        self._warm_turn_causal_cache_protection_seconds = 0.0
+        self._warm_turn_causal_cache_last_admission_seconds = 0.0
+        self._warm_turn_causal_cache_last_protection_seconds = 0.0
 
     def _device_cache_group_size_locked(
         self,
